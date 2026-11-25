@@ -43,18 +43,23 @@
   }
 
   // The fitted model, as the page recomputes it: log10(value at launch) = a + b log10(tvl) +
-  // peerAdj, and the implied value is that figure times the plain peer-odds factor
-  // 0.6 + 0.8 x odds_base. The age-decayed odds printed on the row never enter the recompute.
-  // The peer adjustment comes from the peer table main.ts fitted.
+  // peerAdj + c x growth + d x maturity, where growth is the seven-day change clamped to
+  // [-50, 100] and scaled by 1/100, maturity is ln(1 + age) / ln(1096) capped at 1 (an unknown
+  // age takes the fit set's median), and the implied value is that figure times the plain
+  // peer-odds factor 0.6 + 0.8 x odds_base. The age-decayed odds printed on the row never
+  // enter the recompute. The peer adjustment comes from the peer table main.ts fitted.
   var PEERS = {};
   DATA.peers.forEach(function (p) { PEERS[p.category] = p; });
   function impliedOf(row) {
     var fit = DATA.fit;
     var peer = PEERS[row.category || 'Uncategorised'];
     var adj = peer ? peer.peer_adj_log10 : 0;
-    var conditional = Math.pow(10, fit.intercept + fit.slope * Math.log10(Math.max(row.tvl_usd, 1)) + adj);
+    var growth = Math.min(100, Math.max(-50, row.change_7d === null || row.change_7d === undefined ? 0 : row.change_7d)) / 100;
+    var age = row.age_days === null || row.age_days === undefined ? fit.median_fit_age : row.age_days;
+    var maturity = Math.min(Math.log1p(Math.max(age, 0)) / Math.log1p(1095), 1);
+    var conditional = Math.pow(10, fit.intercept + fit.slope * Math.log10(Math.max(row.tvl_usd, 1)) + adj + fit.growth_coef * growth + fit.maturity_coef * maturity);
     var mult = 0.6 + 0.8 * row.odds_base;
-    return { implied: Math.max(1, Math.min(1e14, Math.round(conditional * mult))), conditional: Math.max(1, Math.round(conditional)), oddsMult: mult, peerAdj: adj };
+    return { implied: Math.max(1, Math.min(1e14, Math.round(conditional * mult))), conditional: Math.max(1, Math.round(conditional)), oddsMult: mult, peerAdj: adj, growth: growth, maturity: maturity };
   }
 
   function el(tag, attrs) {
@@ -354,14 +359,15 @@
       el('h2', { text: 'How the implied value is computed' }),
       el('p', { class: 'sub', text: 'Every row is scored by one fitted function of the snapshot figures. No protocol name is special-cased, and no row is hand-picked.' }),
       el('div', { class: 'formula' },
-        'log10(value at launch) = ' + f.intercept + ' + ' + f.slope + ' x log10(tvl) + peerAdj   (R2 ' + f.r2 + ', n = ' + f.n_fit + ' live-token protocols)\n' +
+        'log10(value at launch) = ' + f.intercept + ' + ' + f.slope + ' x log10(tvl) + peerAdj + ' + f.growth_coef + ' x growth + ' + f.maturity_coef + ' x maturity   (R2 ' + f.r2 + ', n = ' + f.n_fit + ' live-token protocols)\n' +
+        'growth = clamp(7d TVL change, -50, 100) / 100; maturity = ln(1 + age_days) / ln(1096), capped at 1; an unknown age takes the fit set\u2019s median age of ' + f.median_fit_age + ' days\n' +
         'implied value = round(value at launch x (0.6 + 0.8 x peer launch odds)): the board\u2019s number\n' +
         'range = implied widened by 10^(+/- category band) from held-out residuals\n' +
         'printed launch odds = peer odds x ageFactor(age_days): context beside the value; the age factor is never in it'
       ),
-      el('p', { class: 'sub', text: 'The size curve is a least-squares fit of market cap on TVL across the ' + f.n_fit + ' live-token protocols that carry a positive market cap; the slope below 1 is the sublinear size curve. Each category shifts the line by its median residual, shrunk toward zero. The value model is that line, the peer adjustment, and one multiplier: the category\u2019s plain launch odds, as the factor 0.6 + 0.8 x odds. A protocol\u2019s seven-day growth and its age are printed on its row and neither moves the number; the age curve below decays the printed odds and does not touch the value either.' }),
+      el('p', { class: 'sub', text: 'The size curve is a least-squares fit of market cap on TVL across the ' + f.n_fit + ' live-token protocols that carry a positive market cap; the slope below 1 is the sublinear size curve. Each category shifts the line by its median residual, shrunk toward zero, and that peer adjustment enters the regression as a fixed offset. The growth and maturity terms are not hand-set multipliers: their coefficients (c = ' + f.growth_coef + ' on growth, d = ' + f.maturity_coef + ' on maturity) are fitted by the same least squares, so each fit learns how much weight its own protocols put on a hot week and on time spent listed. Both coefficients are held inside [-0.6, 0.6] by the fit itself \u2014 one a fit would push past the bound is fixed at the bound and the rest refitted \u2014 so a small training fold cannot turn either term into a lever. The fitted figure is then weighted by one multiplier: the category\u2019s plain launch odds, as the factor 0.6 + 0.8 x odds. The age curve below decays the printed odds and does not touch the value either.' }),
       el('p', { class: 'sub', text: 'Launch odds are one record printed two ways. The plain share of protocols at or above the $50M floor in the same category that already trade (global ' + fmtOdds(f.global_odds) + '), shrunk toward the global share, is the odds inside the value, as the factor above. The odds printed on each row then decay with age: a survival curve fitted on all ' + f.age_curve.population + ' dated protocols reads the share still pre-token at each age; the oldest protocols put the never-launch floor at ' + Math.round(f.age_curve.s_inf * 100) + '%, and what remains of a protocol\u2019s launch window at its age, relative to the pre-token average, is its age factor: x' + young.factor.toFixed(2) + ' at ' + fmtAge(young.age) + ', x' + old.factor.toFixed(2) + ' at ' + fmtAge(old.age) + '. The longer a protocol has sat pre-token, the less of its launch window is left. That decayed figure is context and ranks the farms; it does not adjust the value any further. Age is the time since the protocol was first listed; an unknown age takes the pre-token median of ' + f.median_pre_age + ' days.' }),
-      el('p', { class: 'sub', text: 'Earlier versions of this model went further both ways: the first also multiplied the value by growth and maturity terms, and a later one dropped the odds factor altogether. The ablation below \u2014 each shipped term removed, each dropped term added back, under the same folds \u2014 prints what each one does to the only ground truth available, market caps that already exist. The plain odds factor is the one multiplier that earned its place there; growth, maturity and the age decay did not.' }),
+      el('p', { class: 'sub', text: 'This model is the synthesis of its four predecessors. The first multiplied the value by growth and maturity terms with hand-set shapes and strengths; the third dropped every multiplier and scored the cleanest cross-validation, then lost walk-forward trials to the first, whose shrinkage helped exactly when a fit was carried forward in time; the fourth kept only the odds factor and beat the rest head-to-head. So the growth and maturity terms are back, but fitted instead of hand-set: the regression itself decides their sign and strength on each training set, inside the stated bounds. The ablation below \u2014 each shipped term removed in turn, the one remaining dropped variant (age-decayed odds) added back \u2014 prints what each does to the only ground truth available, market caps that already exist.' }),
       el('h3', { text: 'Validation, computed at build time on protocols the fit had not seen' }),
       el('p', { class: 'sub', text: 'Each scheme scores the board\u2019s exact printed number (the implied value) for a live-token protocol treated as if it were pre-token, against its real market cap. Every fit inside a split sees only that split\u2019s training protocols.' }),
       el('div', { class: 'table-wrap' }, el('table', null,
@@ -379,7 +385,7 @@
         el('thead', null, el('tr', null, el('th', { scope: 'col', text: 'Term' }), el('th', { scope: 'col', text: 'Median error of the variant' }), el('th', { scope: 'col', text: 'Verdict' }))),
         el('tbody', null, ablRows)
       )),
-      el('p', { class: 'sub', text: 'Read the ablation honestly: it tests every term as a predictor of market caps that already exist, the only ground truth the snapshot holds. The three shipped terms are removed in turn; the three dropped variants are added back in turn, and each variant\u2019s error is printed next to the shipped model\u2019s ' + cvx + 'x. Nothing is hidden either way: the growth and age figures the dropped terms used are still printed on every row, and the printed odds still rank the farms.' }),
+      el('p', { class: 'sub', text: 'Read the ablation honestly: it tests every term as a predictor of market caps that already exist, the only ground truth the snapshot holds. The five shipped terms are removed in turn; the one dropped variant is added back, and each variant\u2019s error is printed next to the shipped model\u2019s ' + cvx + 'x. Nothing is hidden either way: a term whose removal would lower the error says so in its verdict, and the printed odds still rank the farms.' }),
       el('h3', { text: 'Farm economics' }),
       el('p', { class: 'sub', text: 'Each plan\u2019s cost is its gas alone (the position capital stays in the position), and its hours are the steps\u2019 own times over the hold. The $/hour figure is a stated scenario, not a forecast: if a launch values the protocol at its value at launch and pays 5% of that to early users, split evenly over 10,000 qualifying wallets, the expected value is the printed launch odds times that share, divided by the plan\u2019s hours. It is where the age-decayed odds meet the value at launch. Most launches pay nothing like it; many pay nothing at all.' }),
       el('p', { class: 'sub', text: 'Read the validation honestly: the fitted model beats a flat multiple, but market caps vary widely around TVL, so an implied value is an order-of-magnitude estimate with the range printed beside it, not a price.' })
@@ -420,14 +426,14 @@
         el('div', null, el('span', { text: 'TVL' }), el('b', { class: 'num', text: fmtUsd(row.tvl_usd) })),
         el('div', null, el('span', { text: 'Peer multiple (' + (row.category || 'Uncategorised') + ')' }), el('b', { class: 'num', text: row.peer_multiple.toFixed(2) + 'x' })),
         el('div', null, el('span', { text: 'Peer adjustment (log10)' }), el('b', { class: 'num', text: (row.peer_adj_log10 >= 0 ? '+' : '') + row.peer_adj_log10.toFixed(2) })),
-        el('div', null, el('span', { text: 'Seven-day growth (recorded, not in the value)' }), el('b', { class: 'num', text: fmtPct(row.change_7d) })),
-        el('div', null, el('span', { text: 'Age with no token (recorded, not in the value)' }), el('b', { class: 'num', text: fmtAge(row.age_days) })),
-        el('div', null, el('span', { text: 'Value at launch (line x peer adjustment)' }), el('b', { class: 'num', text: fmtUsd(row.conditional_value_usd) })),
+        el('div', null, el('span', { text: 'Seven-day growth term (fitted c x growth)' }), el('b', { class: 'num', text: 'x' + Math.pow(10, DATA.fit.growth_coef * recomputed.growth).toFixed(2) + ' on ' + fmtPct(row.change_7d) })),
+        el('div', null, el('span', { text: 'Age term (fitted d x maturity)' }), el('b', { class: 'num', text: 'x' + Math.pow(10, DATA.fit.maturity_coef * recomputed.maturity).toFixed(2) + ' at ' + fmtAge(row.age_days) })),
+        el('div', null, el('span', { text: 'Value at launch (line x peer adjustment x fitted terms)' }), el('b', { class: 'num', text: fmtUsd(row.conditional_value_usd) })),
         el('div', null, el('span', { text: 'Peer launch odds factor (0.6 + 0.8 x ' + fmtOdds(row.odds_base) + ')' }), el('b', { class: 'num', text: 'x' + recomputed.oddsMult.toFixed(2) })),
         el('div', { class: 'total' }, el('span', { text: 'Implied value' }), el('b', { class: 'num', text: fmtUsd(row.implied_value_usd) })),
         el('div', null, el('span', { text: 'Value range (80% band)' }), el('b', { class: 'num', text: fmtUsd(row.value_low_usd) + ' to ' + fmtUsd(row.value_high_usd) }))
       ),
-      el('p', { class: 'sub', text: 'Model ' + DATA.model_version + ': the implied value is the fitted line and the category\u2019s peer adjustment \u2014 the value at launch \u2014 weighted by the plain peer launch odds through the factor shown. The age curve does not adjust it further. The page recomputes this row as ' + fmtUsd(recomputed.implied) + (agrees ? ', the same number board.json carries.' : ', which differs from the board: the data would be stale.') + ' This is an estimate, not a price.' })
+      el('p', { class: 'sub', text: 'Model ' + DATA.model_version + ': the implied value is the fitted regression \u2014 the line, the category\u2019s peer adjustment and the fitted growth and age terms (c = ' + DATA.fit.growth_coef + ', d = ' + DATA.fit.maturity_coef + ', fitted on the live-token protocols, each held inside [-0.6, 0.6]) \u2014 weighted by the plain peer launch odds through the factor shown. The age curve does not adjust it further. The page recomputes this row as ' + fmtUsd(recomputed.implied) + (agrees ? ', the same number board.json carries.' : ', which differs from the board: the data would be stale.') + ' This is an estimate, not a price.' })
     ));
     dialog.appendChild(el('section', { class: 'detail-section' },
       el('h3', { text: 'Launch odds \u2014 the plain share is in the value, the age decay is not' }),
@@ -471,7 +477,7 @@
   function footer() {
     return el('footer', { class: 'foot' },
       el('p', { text: 'Snapshot: ' + DATA.source + '. "No token" means the record carries no token: a protocol on the board may still have a token its DefiLlama record does not carry. Implied values are the entry\u2019s own model, never a price, and never a prediction of whether or when a token is issued.' }),
-      el('p', { text: 'Model ' + DATA.model_version + ': log10(mcap) = ' + DATA.fit.intercept + ' + ' + DATA.fit.slope + ' log10(tvl) + peer adjustment gives the value at launch; the implied value multiplies it by 0.6 + 0.8 x the category\u2019s plain launch odds; the age-decayed odds are printed separately and never adjust the value further; fitted on ' + DATA.fit.n_fit + ' live-token protocols; 5-fold cross-validated median error ' + Math.pow(10, DATA.validation.cv.median_abs_log10).toFixed(1) + 'x on the printed number.' })
+      el('p', { text: 'Model ' + DATA.model_version + ': log10(mcap) = ' + DATA.fit.intercept + ' + ' + DATA.fit.slope + ' log10(tvl) + peer adjustment + ' + DATA.fit.growth_coef + ' x growth + ' + DATA.fit.maturity_coef + ' x maturity gives the value at launch; the implied value multiplies it by 0.6 + 0.8 x the category\u2019s plain launch odds; the age-decayed odds are printed separately and never adjust the value further; fitted on ' + DATA.fit.n_fit + ' live-token protocols; 5-fold cross-validated median error ' + Math.pow(10, DATA.validation.cv.median_abs_log10).toFixed(1) + 'x on the printed number.' })
     );
   }
 

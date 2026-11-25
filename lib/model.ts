@@ -7,19 +7,24 @@
 //
 // Implied value is fitted from the snapshot's own figures only. No protocol name is special-cased.
 //
-//   fit      log10(mcap) = a + b * log10(tvl), ordinary least squares over the live-token
-//            protocols that carry a positive market cap (n = 128 here: 272 record no market
-//            cap, 15 record zero, one records -1). b < 1 is the sublinear size curve: a
-//            protocol ten times larger is worth less than ten times as much. A multivariate
-//            fit that also regressed on age and seven-day growth was tried and dropped: its
-//            cross-validated error was worse (0.62 vs 0.56 in log10), so the simpler line stays.
-//   peers    each category's median residual from that line, shrunk toward 0 by its sample size,
-//            clamped to +/-0.5 in log10: the category's peer multiple, in log form.
-//   implied  round(10^(a + b*log10(tvl) + peerAdj) * (0.6 + 0.8 * odds)), at least $1: the
-//            value at launch (the line and the peer adjustment alone, printed beside the
-//            implied figure as the conditional value) weighted by the category's plain
-//            launch odds. Nothing else is multiplied in: no growth term, no maturity term,
-//            and no age decay.
+//   fit      log10(mcap) = a + b * log10(tvl) + peerAdj + c * growth + d * maturity, ordinary
+//            least squares over the live-token protocols that carry a positive market cap
+//            (n = 128 here: 272 record no market cap, 15 record zero, one records -1). The
+//            peer adjustment enters as an offset (below); a, b, c and d are fitted together.
+//            growth is the seven-day TVL change, clamped to [-50, 100] and scaled by 1/100;
+//            maturity is age on a log scale, ln(1 + age_days) / ln(1096), capped at 1, with an
+//            unknown age taking the fit set's median age. b < 1 is the sublinear size curve:
+//            a protocol ten times larger is worth less than ten times as much. c and d are
+//            held inside [-0.6, 0.6] by the fit itself (a coefficient a fit would push past
+//            the bound is fixed at the bound and the rest refitted): a stated guard, so a
+//            small fold's noise cannot turn either fitted term into a lever.
+//   peers    each category's median residual from the plain log-log line, shrunk toward 0 by
+//            its sample size, clamped to +/-0.5 in log10: the category's peer multiple, in
+//            log form. It enters the regression as a fixed offset, exactly as fitted before.
+//   implied  round(10^(a + b*log10(tvl) + peerAdj + c*growth + d*maturity) * (0.6 + 0.8 * odds)),
+//            at least $1: the value at launch (the fitted figure before the odds factor,
+//            printed beside the implied figure as the conditional value) weighted by the
+//            category's plain launch odds. No age decay is multiplied in.
 //   odds     the share of protocols at or above the floor in the same category that already trade,
 //            shrunk toward the global share: how often the peers launched. That plain share is
 //            the odds that enter the value, through the factor above. The odds printed on a row
@@ -36,11 +41,16 @@
 // (0.70 + 0.30 * min(ln(1 + age_days) / ln(1096), 1)) and the launch odds (0.6 + 0.8 * odds);
 // radar-fit-2 swapped in age-decayed odds; radar-fit-3 dropped all three multipliers and
 // scored the best full-data cross-validation of the three, but lost held-out walk-forward
-// trials to radar-fit-1, whose shrinkage the odds factor provides. radar-fit-4 keeps exactly
-// one multiplier, the plain odds: the ablation below removes each shipped term in turn and
-// adds each dropped term back under the same cross-validation folds, and prints what each
-// does to the held-out error. The growth and age figures still show on every row; only the
-// multiplications that failed the ablation are gone.
+// trials to radar-fit-1, whose shrinkage the odds factor provides. radar-fit-4 kept exactly
+// one multiplier, the plain odds, and won the four-version Swiss tournament head-to-head,
+// though its stripped core still trailed radar-fit-1's shrinkage on the earliest
+// walk-forward splits. radar-fit-5 is the synthesis: radar-fit-4's spine, with the two
+// hand-set shapes of radar-fit-1 replaced by fitted coefficients — the growth and maturity
+// features enter the regression itself, so each training fold learns how much shrinkage its
+// own era supports instead of inheriting constants set by hand. The ablation below removes
+// each shipped term in turn and adds the one remaining dropped variant (age-decayed odds)
+// back, and prints what each does to the held-out error. The growth and age figures still
+// show on every row.
 //   range    every row also carries a value range: the implied value widened by a per-category
 //            band whose half-width is the 80th percentile of that category's cross-validated
 //            residuals (shrunk toward the global band), so a row's range is as honest as the
@@ -95,6 +105,12 @@ export interface AgeCurve {
 export interface FitParams {
   intercept: number;
   slope: number;
+  /** The fitted coefficient on the growth feature (seven-day change, clamped and scaled). */
+  growth_coef: number;
+  /** The fitted coefficient on the maturity feature (age on a log scale, capped at 1). */
+  maturity_coef: number;
+  /** The fit set's median age in days: the age an undated protocol is scored with. */
+  median_fit_age: number;
   r2: number;
   n_fit: number;
   global_median_multiple: number;
@@ -139,22 +155,23 @@ export interface Validation {
 
 /**
  * Switches that vary the model for the ablation. The shipped model runs with every switch at
- * its default: the fitted line, the peer adjustment and the plain launch-odds factor in; the
- * growth and maturity terms out, and the odds factor free of age decay. base:false, peer:false
- * and odds:false remove a shipped term; growth:true and maturity:true add a dropped term back;
- * odds_age_decay:true swaps the plain odds in the factor for the age-decayed odds.
+ * its default: the fitted line, the peer adjustment, the fitted growth and maturity
+ * coefficients and the plain launch-odds factor in, and the odds factor free of age decay.
+ * base:false, peer:false, growth_coef:false, maturity_coef:false and odds:false remove a
+ * shipped term; odds_age_decay:true swaps the plain odds in the factor for the age-decayed
+ * odds, the one dropped variant the ablation still adds back.
  */
 export interface TermFlags {
   base?: boolean;
   peer?: boolean;
   odds?: boolean;
   odds_age_decay?: boolean;
-  growth?: boolean;
-  maturity?: boolean;
+  growth_coef?: boolean;
+  maturity_coef?: boolean;
 }
 
 /** The model's version label: the dashboard names it. */
-export const MODEL_VERSION = 'radar-fit-4';
+export const MODEL_VERSION = 'radar-fit-5';
 
 /** The flat rule the validation compares against: the starter's 0.25xTVL. */
 const BASELINE_MULTIPLE = 0.25;
@@ -164,6 +181,8 @@ const PEER_SHRINK = 2;
 const ODDS_SHRINK = 8;
 /** The peer adjustment's clamp, in log10: no category moves a value more than ~3.2x either way. */
 const PEER_CLAMP = 0.5;
+/** The fitted growth/maturity coefficients' clamp: a stated guard against small-fold noise. */
+const COEF_CLAMP = 0.6;
 /** Folds for cross-validation. */
 const FOLDS = 5;
 /** Age buckets (days) for the launch-odds survival curve. */
@@ -270,13 +289,53 @@ function catKey(p: SnapshotProtocol): string {
   return p.category ?? 'Uncategorised';
 }
 
+/** The growth feature: the seven-day TVL change, clamped to [-50, 100] and scaled by 1/100. */
+function growthFeature(change7d: number | null): number {
+  return Math.min(100, Math.max(-50, finite(change7d, 0))) / 100;
+}
+
+/** The maturity feature: age on a log scale, 0 at listing and 1 at three years (1096 days). */
+function maturityFeature(age: number | null, fallbackAge: number): number {
+  const a = age ?? fallbackAge;
+  return Math.min(Math.log1p(Math.max(a, 0)) / Math.log1p(1095), 1);
+}
+
+/** Solve a small dense linear system by Gaussian elimination with partial pivoting; null if singular. */
+function solveLinear(matrix: number[][], rhs: number[]): number[] | null {
+  const n = rhs.length;
+  const a = matrix.map((row, i) => [...row, rhs[i]!]);
+  for (let col = 0; col < n; col++) {
+    let pivot = col;
+    for (let r = col + 1; r < n; r++) if (Math.abs(a[r]![col]!) > Math.abs(a[pivot]![col]!)) pivot = r;
+    if (Math.abs(a[pivot]![col]!) < 1e-12) return null;
+    if (pivot !== col) [a[col], a[pivot]] = [a[pivot]!, a[col]!];
+    for (let r = col + 1; r < n; r++) {
+      const f = a[r]![col]! / a[col]![col]!;
+      for (let k = col; k <= n; k++) a[r]![k] = a[r]![k]! - f * a[col]![k]!;
+    }
+  }
+  const x = new Array<number>(n).fill(0);
+  for (let r = n - 1; r >= 0; r--) {
+    let s = a[r]![n]!;
+    for (let k = r + 1; k < n; k++) s -= a[r]![k]! * x[k]!;
+    x[r] = s / a[r]![r]!;
+  }
+  return x;
+}
+
 /**
- * Fit the value model on a set of live-token protocols: the log-log line, each category's shrunk
- * median residual (the peer adjustment), and each category's shrunk median mcap/TVL multiple.
+ * Fit the value model on a set of live-token protocols: each category's shrunk median residual
+ * from the plain log-log line (the peer adjustment), then one least-squares fit of
+ * log10(mcap) on [1, log10(tvl), growth, maturity] with the peer adjustment as a fixed offset.
+ * The growth and maturity coefficients are held inside +/-COEF_CLAMP by the bounded fit
+ * described below. The R2 is the full prediction's, offset included.
  */
-function fitValueModel(rows: SnapshotProtocol[]): {
+function fitValueModel(rows: SnapshotProtocol[], asOf: string): {
   intercept: number;
   slope: number;
+  growth_coef: number;
+  maturity_coef: number;
+  median_fit_age: number;
   r2: number;
   n_fit: number;
   global_median_multiple: number;
@@ -284,14 +343,14 @@ function fitValueModel(rows: SnapshotProtocol[]): {
   peer_multiple: Record<string, number>;
   peer_n: Record<string, number>;
 } {
-  const { intercept, slope, r2 } = logLogFit(rows);
+  const { intercept: lineA, slope: lineB } = logLogFit(rows);
   const multiples = rows.map((p) => p.mcap_usd! / p.tvl_usd);
   const globalMed = median(multiples) ?? BASELINE_MULTIPLE;
   const residuals: Record<string, number[]> = {};
   const catMultiples: Record<string, number[]> = {};
   for (const p of rows) {
     const key = catKey(p);
-    (residuals[key] ??= []).push(Math.log10(p.mcap_usd!) - (intercept + slope * Math.log10(p.tvl_usd)));
+    (residuals[key] ??= []).push(Math.log10(p.mcap_usd!) - (lineA + lineB * Math.log10(p.tvl_usd)));
     (catMultiples[key] ??= []).push(p.mcap_usd! / p.tvl_usd);
   }
   const peer_adj: Record<string, number> = {};
@@ -306,20 +365,82 @@ function fitValueModel(rows: SnapshotProtocol[]): {
     peer_multiple[key] = round4((rs.length * cm + PEER_SHRINK * globalMed) / (rs.length + PEER_SHRINK));
     peer_n[key] = rs.length;
   }
-  return { intercept, slope, r2, n_fit: rows.length, global_median_multiple: round4(globalMed), peer_adj, peer_multiple, peer_n };
-}
-
-/** The growth term: dampened, so a hot week lifts a row without dominating the size curve. */
-function growthTerm(change7d: number | null): { pct: number; mult: number } {
-  const pct = Math.min(100, Math.max(-50, finite(change7d, 0)));
-  return { pct, mult: 1 + 0.25 * (pct / 100) };
-}
-
-/** The maturity term: logarithmic in age, so the first year matters more than the third. */
-function maturityTerm(age: number | null, fallbackAge: number): { age_used: number; mult: number } {
-  const ageUsed = age ?? fallbackAge;
-  const mult = 0.7 + 0.3 * Math.min(Math.log1p(Math.max(ageUsed, 0)) / Math.log1p(1095), 1);
-  return { age_used: ageUsed, mult };
+  const knownAges = rows.map((p) => ageDays(asOf, p.listed_at)).filter((a): a is number => a !== null);
+  const medianFitAge = Math.round(median(knownAges) ?? 365);
+  // Least squares for [1, x1, x2, x3] against log10(mcap) - peerAdj, with the growth and
+  // maturity coefficients (indices 2 and 3) held inside +/-COEF_CLAMP: when a fit would push
+  // one past the bound, it is fixed at the bound and the remaining coefficients are refitted
+  // (the active-set step of a bounded fit). On folds where age barely varies, the unbounded
+  // fit trades the intercept against the maturity coefficient in the thousands; the bound is
+  // what keeps such a fold's shrinkage a shrinkage, as the header states.
+  const design = rows.map((p) => {
+    const age = ageDays(asOf, p.listed_at);
+    return {
+      x: [1, Math.log10(p.tvl_usd), growthFeature(p.change_7d), maturityFeature(age, medianFitAge)],
+      y: Math.log10(p.mcap_usd!) - (peer_adj[catKey(p)] ?? 0),
+    };
+  });
+  const fitOls = (free: number[], fixedVal: Map<number, number>): number[] | null => {
+    const m = free.length;
+    const xtx: number[][] = Array.from({ length: m }, () => new Array<number>(m).fill(0));
+    const xty = new Array<number>(m).fill(0);
+    for (const { x, y } of design) {
+      let target = y;
+      for (const [idx, val] of fixedVal) target -= val * x[idx]!;
+      for (let i = 0; i < m; i++) {
+        xty[i]! += x[free[i]!]! * target;
+        for (let j = 0; j < m; j++) xtx[i]![j] = xtx[i]![j]! + x[free[i]!]! * x[free[j]!]!;
+      }
+    }
+    return solveLinear(xtx, xty);
+  };
+  const fixedVal = new Map<number, number>();
+  let coef: number[] = [lineA, lineB, 0, 0];
+  for (let step = 0; step < 3; step++) {
+    const free = [0, 1, 2, 3].filter((i) => !fixedVal.has(i));
+    const solved = fitOls(free, fixedVal);
+    if (solved === null) break;
+    coef = [0, 0, 0, 0];
+    free.forEach((idx, i) => (coef[idx] = solved[i]!));
+    for (const [idx, val] of fixedVal) coef[idx] = val;
+    let worst: { idx: number; over: number } | null = null;
+    for (const idx of [2, 3]) {
+      if (fixedVal.has(idx)) continue;
+      const over = Math.abs(coef[idx]!) - COEF_CLAMP;
+      if (over > 0 && (worst === null || over > worst.over)) worst = { idx, over };
+    }
+    if (worst === null) break;
+    fixedVal.set(worst.idx, Math.sign(coef[worst.idx]!) * COEF_CLAMP);
+  }
+  // The bound, stated plainly, whatever the solve above did: neither fitted coefficient
+  // ships outside +/-COEF_CLAMP.
+  coef[2] = Math.max(-COEF_CLAMP, Math.min(COEF_CLAMP, coef[2]!));
+  coef[3] = Math.max(-COEF_CLAMP, Math.min(COEF_CLAMP, coef[3]!));
+  const [intercept, slope, growthCoef, maturityCoef] = coef as [number, number, number, number];
+  let sse = 0;
+  let sst = 0;
+  const meanY = rows.reduce((a, p) => a + Math.log10(p.mcap_usd!), 0) / Math.max(rows.length, 1);
+  for (const p of rows) {
+    const age = ageDays(asOf, p.listed_at);
+    const pred = intercept + slope * Math.log10(p.tvl_usd) + (peer_adj[catKey(p)] ?? 0) + growthCoef * growthFeature(p.change_7d) + maturityCoef * maturityFeature(age, medianFitAge);
+    const y = Math.log10(p.mcap_usd!);
+    sse += (y - pred) * (y - pred);
+    sst += (y - meanY) * (y - meanY);
+  }
+  const r2 = sst === 0 ? 0 : 1 - sse / sst;
+  return {
+    intercept,
+    slope,
+    growth_coef: growthCoef,
+    maturity_coef: maturityCoef,
+    median_fit_age: medianFitAge,
+    r2,
+    n_fit: rows.length,
+    global_median_multiple: round4(globalMed),
+    peer_adj,
+    peer_multiple,
+    peer_n,
+  };
 }
 
 /**
@@ -420,9 +541,11 @@ export function ageFactorAt(curve: AgeCurve, age: number): number {
  * data.js) recomputes exactly the implied values this model scores: the page and board.json agree
  * to the dollar. */
 export function fitModel(snapshot: Snapshot): FitParams {
-  const value = fitValueModel(fitSet(snapshot.protocols));
+  const value = fitValueModel(fitSet(snapshot.protocols), snapshot.as_of);
   value.intercept = round4(value.intercept);
   value.slope = round4(value.slope);
+  value.growth_coef = round4(value.growth_coef);
+  value.maturity_coef = round4(value.maturity_coef);
   const odds = fitOdds(snapshot.protocols, snapshot.floor_usd);
   const ageCurve = fitAgeCurve(snapshot.protocols, snapshot.as_of);
   const preAges = snapshot.protocols
@@ -536,9 +659,9 @@ export function validateModel(snapshot: Snapshot): { validation: Validation; hal
   const ablationSpecs: Array<{ term: string; label: string; variant: 'without' | 'with'; terms: TermFlags }> = [
     { term: 'base', label: 'Fitted TVL line (raw peer multiples instead)', variant: 'without', terms: { base: false } },
     { term: 'peer', label: 'Category peer adjustment', variant: 'without', terms: { peer: false } },
+    { term: 'growth_coef', label: 'Fitted seven-day growth coefficient', variant: 'without', terms: { growth_coef: false } },
+    { term: 'maturity_coef', label: 'Fitted age (maturity) coefficient', variant: 'without', terms: { maturity_coef: false } },
     { term: 'odds', label: 'Peer launch odds factor (0.6 + 0.8 x peer odds)', variant: 'without', terms: { odds: false } },
-    { term: 'growth', label: 'Seven-day growth term', variant: 'with', terms: { growth: true } },
-    { term: 'maturity', label: 'Age maturity term', variant: 'with', terms: { maturity: true } },
     { term: 'age_decay', label: 'Age-decayed odds in the value (plain odds instead)', variant: 'with', terms: { odds_age_decay: true } },
   ];
   const full = cvScore.median_abs_log10;
@@ -696,6 +819,9 @@ export interface RadarData {
   fit: {
     intercept: number;
     slope: number;
+    growth_coef: number;
+    maturity_coef: number;
+    median_fit_age: number;
     r2: number;
     n_fit: number;
     global_median_multiple: number;
@@ -748,16 +874,17 @@ export function scoreProtocol(
   const line = Math.pow(10, fit.intercept + fit.slope * Math.log10(tvl) + peerAdj);
   const base = terms.base === false ? peerMultiple * tvl : line;
   let value = base;
-  // The dropped terms: off in the shipped model, switched on only by the ablation, which adds
-  // each back in turn and prints what it does to the held-out error.
-  if (terms.growth === true) value *= growthTerm(p.change_7d).mult;
-  if (terms.maturity === true) value *= maturityTerm(age, fit.median_pre_age).mult;
+  // The fitted growth and maturity terms: shipped in radar-fit-5 as regression coefficients,
+  // switched off only by the ablation, which removes each in turn and prints what it does to
+  // the held-out error. (radar-fit-1's hand-set multiplier shapes are gone for good.)
+  if (terms.growth_coef !== false) value *= Math.pow(10, fit.growth_coef * growthFeature(p.change_7d));
+  if (terms.maturity_coef !== false) value *= Math.pow(10, fit.maturity_coef * maturityFeature(age, fit.median_fit_age));
   const oddsBase = fit.odds[key] ?? fit.global_odds;
   const ageFactor = ageFactorAt(fit.age_curve, age ?? fit.median_pre_age);
   const odds = Math.min(0.97, Math.max(0.01, round4(oddsBase * ageFactor)));
-  // The one shipped multiplier: the plain peer odds, exactly as radar-fit-1 had them. The
-  // ablation's odds_age_decay switch swaps the age-decayed odds into the factor instead, and
-  // odds:false removes the factor altogether; neither is the shipped model.
+  // The one shipped multiplier beyond the fitted regression: the plain peer odds, exactly as
+  // radar-fit-1 had them. The ablation's odds_age_decay switch swaps the age-decayed odds into
+  // the factor instead, and odds:false removes the factor altogether; neither is shipped.
   const oddsForValue = terms.odds_age_decay === true ? odds : oddsBase;
   const oddsMult = terms.odds === false ? 1 : 0.6 + 0.8 * oddsForValue;
   const conditional = Math.max(1, Math.round(value));
@@ -1116,6 +1243,9 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
     fit: {
       intercept: round4(fit.intercept),
       slope: round4(fit.slope),
+      growth_coef: round4(fit.growth_coef),
+      maturity_coef: round4(fit.maturity_coef),
+      median_fit_age: fit.median_fit_age,
       r2: round4(fit.r2),
       n_fit: fit.n_fit,
       global_median_multiple: fit.global_median_multiple,
