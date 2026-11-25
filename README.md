@@ -20,23 +20,26 @@ Built by an AI agent for make.fun's
   protocols are accounted for.
 - **A fitted value model, not a flat multiple.** `log10(mcap) = a + b·log10(tvl) + peerAdj`, fitted by
   least squares on the 128 live-token protocols with a positive market cap (slope 0.52, R² 0.19),
-  with a per-category peer adjustment from median residuals — and nothing else multiplied in. The
-  implied value is a value at launch: what the token would be worth if the protocol issued one.
-  Launch odds from the peers' record at the $50M floor, decayed by a survival curve over time
-  spent pre-token (fitted on all 645 dated protocols: the longer a protocol has sat pre-token,
-  the less of its launch window is left), are printed beside the value and rank the farms; they
-  never touch the value. Earlier versions multiplied the value by growth, maturity and odds
-  terms; the ablation on the page adds each back and prints what it does to the held-out error.
+  with a per-category peer adjustment from median residuals. That line is the value at launch —
+  what the token would be worth if the protocol issued one — and the board's implied value
+  weights it by the category's plain launch odds, the share of peers at the $50M floor that
+  already trade, as a factor of 0.6 + 0.8 × odds. The odds printed on each row are then decayed
+  by a survival curve over time spent pre-token (fitted on all 645 dated protocols: the longer
+  a protocol has sat pre-token, the less of its launch window is left); that age curve is
+  context and ranks the farms, and never adjusts the value beyond the plain factor. Earlier
+  versions went further both ways — growth and maturity multipliers in, then every multiplier
+  out — and the ablation on the page removes each shipped term and adds each dropped one back,
+  printing what each does to the held-out error.
 - **A value range on every row.** Each implied value carries an 80% band whose width is the
-  category's own cross-validated residual spread (×/÷14.6 typical), so the page shows how far the
+  category's own cross-validated residual spread (×/÷13.9 typical), so the page shows how far the
   model has actually been from the market in that category, not a false point precision. In
-  cross-validation the band held 81% of held-out market caps.
-- **Honest validation, computed at build time.** The printed number — the value at launch — is
+  cross-validation the band held 82% of held-out market caps.
+- **Honest validation, computed at build time.** The printed number — the implied value — is
   scored against the market caps of live-token protocols it was not fitted on: 5-fold
-  cross-validation (median error 3.5x, 28% within 2x) against a flat 0.25xTVL baseline (4.9x), a
-  walk-forward split by listing date (3.2x), leave-one-out (4.0x), and a per-term ablation the
-  dashboard prints in full: the two shipped terms removed in turn, the four dropped terms added
-  back in turn, every variant's error shown.
+  cross-validation (median error 3.4x, 30% within 2x) against a flat 0.25xTVL baseline (4.9x), a
+  walk-forward split by listing date (3.1x), leave-one-out (3.9x), and a per-term ablation the
+  dashboard prints in full: the three shipped terms removed in turn, the three dropped variants
+  added back in turn, every variant's error shown.
 - **Concrete farm plans.** Six steps per protocol with sized capital (standard and minimum-viable),
   chain-aware gas costs, a hold period by age, a second qualifying action per category, and the
   plan's economics: total gas cost, total hours, and a scenario $/hour (a launch paying early
@@ -62,8 +65,10 @@ That writes `out/board.json` (the ranked board), `out/data.js` (the dashboard's 
 
 - `main.ts` — the entrypoint: reads the snapshot, fits the model, writes the board, data and dossier.
 - `lib/model.ts` — the fitted model, the board builder, the farm plans and the validation.
-- `tools/validate36.mjs` — a 36-trial held-out comparison of this model against the v1 model and
+- `tools/validate36.mjs` — a 36-trial held-out comparison of the v3 model against the v1 model and
   the flat baseline (repeated cross-validation, walk-forward and leave-one-category-out splits).
+- `tools/validate24.mjs` — the 24-trial held-out gate for the current (v4) model: pre-declared
+  subsets of the same splits, run once against v1 and the baseline.
 - `dashboard/` — the static page: `index.html`, `app.css`, `app.js`, `farm.js` (the farm-plan
   derivation, mirroring `lib/model.ts` so the page and `board.json` agree).
 - `screenshots/` — the board, a protocol's detail view and a filtered view, taken of the real page.

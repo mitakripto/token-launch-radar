@@ -15,31 +15,39 @@
 //            cross-validated error was worse (0.62 vs 0.56 in log10), so the simpler line stays.
 //   peers    each category's median residual from that line, shrunk toward 0 by its sample size,
 //            clamped to +/-0.5 in log10: the category's peer multiple, in log form.
-//   implied  round(10^(a + b*log10(tvl) + peerAdj)), at least $1: the value at launch, what the
-//            token would be worth if the protocol issued one. Nothing else is multiplied in.
+//   implied  round(10^(a + b*log10(tvl) + peerAdj) * (0.6 + 0.8 * odds)), at least $1: the
+//            value at launch (the line and the peer adjustment alone, printed beside the
+//            implied figure as the conditional value) weighted by the category's plain
+//            launch odds. Nothing else is multiplied in: no growth term, no maturity term,
+//            and no age decay.
 //   odds     the share of protocols at or above the floor in the same category that already trade,
-//            shrunk toward the global share: how often the peers launched. The odds are then aged:
-//            a survival curve fitted on every dated protocol in the snapshot (the share still
-//            pre-token at each age, made non-increasing) gives the chance a protocol that is still
-//            pre-token at a given age ever launches, and each row's odds take that chance relative
-//            to its average over the pre-token population. The longer a protocol has sat pre-token,
-//            the lower its odds: most of its launch window is behind it. The odds are printed
-//            beside the value and drive the farm ranking; they never touch the value itself. A
-//            value at launch and a chance of launching are different questions, kept apart.
+//            shrunk toward the global share: how often the peers launched. That plain share is
+//            the odds that enter the value, through the factor above. The odds printed on a row
+//            are then aged: a survival curve fitted on every dated protocol in the snapshot (the
+//            share still pre-token at each age, made non-increasing) gives the chance a protocol
+//            that is still pre-token at a given age ever launches, and each row's printed odds
+//            take that chance relative to its average over the pre-token population. The longer
+//            a protocol has sat pre-token, the lower its printed odds: most of its launch window
+//            is behind it. The age curve is context and drives the farm ranking; it does not
+//            adjust the value any further.
 //
-// Earlier versions (radar-fit-1, radar-fit-2) multiplied the value by a dampened seven-day
-// growth term (1 + 0.25 * clamp(change_7d, -50, 100) / 100), a logarithmic maturity term
-// (0.70 + 0.30 * min(ln(1 + age_days) / ln(1096), 1)) and the launch odds (0.6 + 0.8 * odds).
-// radar-fit-3 drops all three from the value: the ablation below adds each back under the same
-// cross-validation folds and prints what it does to the held-out error. The growth and age
-// figures still show on every row; only the multiplication is gone.
+// Earlier versions: radar-fit-1 multiplied the value by a dampened seven-day growth term
+// (1 + 0.25 * clamp(change_7d, -50, 100) / 100), a logarithmic maturity term
+// (0.70 + 0.30 * min(ln(1 + age_days) / ln(1096), 1)) and the launch odds (0.6 + 0.8 * odds);
+// radar-fit-2 swapped in age-decayed odds; radar-fit-3 dropped all three multipliers and
+// scored the best full-data cross-validation of the three, but lost held-out walk-forward
+// trials to radar-fit-1, whose shrinkage the odds factor provides. radar-fit-4 keeps exactly
+// one multiplier, the plain odds: the ablation below removes each shipped term in turn and
+// adds each dropped term back under the same cross-validation folds, and prints what each
+// does to the held-out error. The growth and age figures still show on every row; only the
+// multiplications that failed the ablation are gone.
 //   range    every row also carries a value range: the implied value widened by a per-category
 //            band whose half-width is the 80th percentile of that category's cross-validated
 //            residuals (shrunk toward the global band), so a row's range is as honest as the
 //            model's own held-out record in that category, no tighter.
 //
 // Validation is computed at build time, on the live-token protocols only, and reported honestly.
-// It scores the board's exact printed number (the value at launch) for a
+// It scores the board's exact printed number (the implied value) for a
 // live-token protocol treated as if it were pre-token, against its actual market cap: the
 // strictest test of the printed figure. Four schemes: five-fold cross-validation (folds by a
 // hash of the slug, so they are deterministic), a walk-forward split by listing date,
@@ -131,21 +139,22 @@ export interface Validation {
 
 /**
  * Switches that vary the model for the ablation. The shipped model runs with every switch at
- * its default: the fitted line and the peer adjustment in, the growth, maturity and odds terms
- * out of the value. base:false and peer:false remove a shipped term; growth, maturity and
- * odds:true add a dropped term back (age_decay:false keeps the age decay out of an added odds).
+ * its default: the fitted line, the peer adjustment and the plain launch-odds factor in; the
+ * growth and maturity terms out, and the odds factor free of age decay. base:false, peer:false
+ * and odds:false remove a shipped term; growth:true and maturity:true add a dropped term back;
+ * odds_age_decay:true swaps the plain odds in the factor for the age-decayed odds.
  */
 export interface TermFlags {
   base?: boolean;
   peer?: boolean;
+  odds?: boolean;
+  odds_age_decay?: boolean;
   growth?: boolean;
   maturity?: boolean;
-  odds?: boolean;
-  age_decay?: boolean;
 }
 
 /** The model's version label: the dashboard names it. */
-export const MODEL_VERSION = 'radar-fit-3';
+export const MODEL_VERSION = 'radar-fit-4';
 
 /** The flat rule the validation compares against: the starter's 0.25xTVL. */
 const BASELINE_MULTIPLE = 0.25;
@@ -454,7 +463,7 @@ function subSnapshot(snapshot: Snapshot, protocols: SnapshotProtocol[]): Snapsho
 }
 
 /**
- * Five-fold cross-validated predictions of the board's printed number (the value at launch) for
+ * Five-fold cross-validated predictions of the board's printed number (the implied value) for
  * every fitted protocol: each fold's model is fitted on the other folds' protocols alone (value
  * line, peer figures, launch odds and the age curve alike), then asked for the printed number
  * of each held-out protocol, as if it were pre-token.
@@ -500,7 +509,7 @@ export function rangeHalfWidths(pairs: CvPair[]): { per_cat: Record<string, numb
  * Validate the model on the live-token protocols, honestly, under four schemes, every fit inside
  * a split seeing only that split's training protocols: five-fold cross-validation, a
  * walk-forward split by listing date, leave-one-out, and a per-term ablation under the same
- * folds. The scored prediction is the board's printed number, the value at launch.
+ * folds. The scored prediction is the board's printed number, the implied value.
  */
 export function validateModel(snapshot: Snapshot): { validation: Validation; half_widths: { per_cat: Record<string, number>; global: number } } {
   const rows = fitSet(snapshot.protocols);
@@ -527,10 +536,10 @@ export function validateModel(snapshot: Snapshot): { validation: Validation; hal
   const ablationSpecs: Array<{ term: string; label: string; variant: 'without' | 'with'; terms: TermFlags }> = [
     { term: 'base', label: 'Fitted TVL line (raw peer multiples instead)', variant: 'without', terms: { base: false } },
     { term: 'peer', label: 'Category peer adjustment', variant: 'without', terms: { peer: false } },
+    { term: 'odds', label: 'Peer launch odds factor (0.6 + 0.8 x peer odds)', variant: 'without', terms: { odds: false } },
     { term: 'growth', label: 'Seven-day growth term', variant: 'with', terms: { growth: true } },
     { term: 'maturity', label: 'Age maturity term', variant: 'with', terms: { maturity: true } },
-    { term: 'odds', label: 'Launch odds term, age-decayed', variant: 'with', terms: { odds: true } },
-    { term: 'age_decay', label: 'Launch odds term, no age decay', variant: 'with', terms: { odds: true, age_decay: false } },
+    { term: 'age_decay', label: 'Age-decayed odds in the value (plain odds instead)', variant: 'with', terms: { odds_age_decay: true } },
   ];
   const full = cvScore.median_abs_log10;
   const ablation: AblationRow[] = ablationSpecs.map((spec) => {
@@ -714,7 +723,7 @@ export class SnapshotError extends Error {
   }
 }
 
-/** One protocol's full scoring: the value at launch, and the launch odds kept apart from it. */
+/** One protocol's full scoring: the implied value, its value-at-launch part, and the launch odds. */
 export function scoreProtocol(
   p: SnapshotProtocol,
   snapshot: Snapshot,
@@ -725,6 +734,7 @@ export function scoreProtocol(
   conditional: number;
   odds: number;
   oddsBase: number;
+  oddsMult: number;
   ageFactor: number;
   age: number | null;
   peerMultiple: number;
@@ -745,16 +755,19 @@ export function scoreProtocol(
   const oddsBase = fit.odds[key] ?? fit.global_odds;
   const ageFactor = ageFactorAt(fit.age_curve, age ?? fit.median_pre_age);
   const odds = Math.min(0.97, Math.max(0.01, round4(oddsBase * ageFactor)));
-  if (terms.odds === true) {
-    const o = terms.age_decay === false ? oddsBase : odds;
-    value *= 0.6 + 0.8 * Math.min(0.97, Math.max(0.01, o));
-  }
-  const implied = Math.max(1, Math.min(100_000_000_000_000, Math.round(value)));
+  // The one shipped multiplier: the plain peer odds, exactly as radar-fit-1 had them. The
+  // ablation's odds_age_decay switch swaps the age-decayed odds into the factor instead, and
+  // odds:false removes the factor altogether; neither is the shipped model.
+  const oddsForValue = terms.odds_age_decay === true ? odds : oddsBase;
+  const oddsMult = terms.odds === false ? 1 : 0.6 + 0.8 * oddsForValue;
+  const conditional = Math.max(1, Math.round(value));
+  const implied = Math.max(1, Math.min(100_000_000_000_000, Math.round(value * oddsMult)));
   return {
     implied,
-    conditional: implied,
+    conditional,
     odds,
     oddsBase: round4(oddsBase),
+    oddsMult: round4(oddsMult),
     ageFactor: round4(ageFactor),
     age,
     peerMultiple,
@@ -781,7 +794,7 @@ export function buildBoard(snapshot: Snapshot, fit: FitParams, halfWidths: { per
     const h = halfWidths.per_cat[catKey(p)] ?? halfWidths.global;
     const low = Math.min(s.implied, Math.max(1, Math.round(s.implied * Math.pow(10, -h))));
     const high = Math.max(s.implied, Math.min(100_000_000_000_000, Math.round(s.implied * Math.pow(10, h))));
-    const econ = farmEconomics(p, s.age, s.implied, s.odds);
+    const econ = farmEconomics(p, s.age, s.conditional, s.odds);
     return {
       rank: i + 1,
       slug: p.slug,
@@ -950,16 +963,18 @@ function gasUsdFor(chain: string): { setup: number; weekly: number } {
  * A farm plan's economics, from the plan's own steps: the out-of-pocket cost (gas only; the
  * position capital stays in the position and is not a cost), the total hours of effort, and a
  * scenario expected value. The scenario is stated, not hidden: if the token launches at the
- * row's implied value (the value at launch), FARM_REWARD_SHARE of that value reaches early
+ * row's value at launch (its conditional value, before the odds factor), FARM_REWARD_SHARE
+ * of that value reaches early
  * users, split evenly among FARM_ASSUMED_WALLETS qualifying wallets; the expected value weights
- * that by the row's launch odds — the one place value and odds meet — and $/hour divides it by
+ * that by the row's printed (age-decayed) launch odds — where the age curve meets a value,
+ * in a stated scenario — and $/hour divides it by
  * the plan's hours. An estimate under a stated scenario, never a promise: most launches pay
  * nothing like it, and many pay nothing at all.
  */
 export function farmEconomics(
   p: SnapshotProtocol,
   age: number | null,
-  implied: number,
+  valueAtLaunch: number,
   odds: number,
 ): { cost_usd: number; hours: number; expected_usd: number; value_per_hour_usd: number; hold_days: number; weeks: number } {
   const gas = gasUsdFor(chainOf(p));
@@ -967,7 +982,7 @@ export function farmEconomics(
   const weeks = Math.max(1, Math.ceil(hold / 7));
   const cost = 2 * gas.setup + weeks * gas.weekly;
   const hours = (45 + 10 * weeks) / 60;
-  const expected = (odds * FARM_REWARD_SHARE * implied) / FARM_ASSUMED_WALLETS;
+  const expected = (odds * FARM_REWARD_SHARE * valueAtLaunch) / FARM_ASSUMED_WALLETS;
   return {
     cost_usd: round2(cost),
     hours: round2(hours),
