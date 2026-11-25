@@ -30,6 +30,17 @@
     return Math.max(0, Math.round(days)) + 'd';
   }
   function fmtOdds(o) { return Math.round(o * 100) + '%'; }
+  function fmtCost(n) {
+    if (n === null || n === undefined || !isFinite(n)) return 'n/a';
+    if (n > 0 && n < 1) return '$' + n.toFixed(2);
+    return fmtUsd(n);
+  }
+  function fmtPerHour(n) {
+    if (n === null || n === undefined || !isFinite(n) || n <= 0) return '$0/h';
+    if (n >= 100) return '$' + Math.round(n) + '/h';
+    if (n >= 1) return '$' + n.toFixed(1) + '/h';
+    return '$' + n.toFixed(2) + '/h';
+  }
 
   // The fitted model, as the page recomputes it: log10(mcap) = a + b log10(tvl) + peerAdj, times the
   // growth, maturity and odds terms. The peer adjustment comes from the peer table main.ts fitted.
@@ -128,6 +139,7 @@
       else if (key === 'growth') { av = a.change_7d === null ? -Infinity : a.change_7d; bv = b.change_7d === null ? -Infinity : b.change_7d; }
       else if (key === 'age') { av = a.age_days === null ? Infinity : a.age_days; bv = b.age_days === null ? Infinity : b.age_days; }
       else if (key === 'odds') { av = a.token_odds; bv = b.token_odds; }
+      else if (key === 'farm') { av = a.farm_value_per_hour_usd; bv = b.farm_value_per_hour_usd; }
       else { av = a.implied_value_usd; bv = b.implied_value_usd; }
       if (av < bv) return -state.dir;
       if (av > bv) return state.dir;
@@ -169,7 +181,7 @@
     var totalExcluded = a.excluded.reduce(function (n, e) { return n + e.count; }, 0);
     return el('section', { class: 'integrity' },
       el('span', { html: '<b>Integrity:</b> all ' + a.total + ' snapshot protocols accounted for: <b>' + a.ranked + ' ranked</b> (' + a.watchlist + ' watchlist + ' + a.early + ' early), <b>' + a.live + ' live-token</b> set aside with their market caps, <b>' + totalExcluded + ' excluded</b> (' + excluded + '). ' }),
-      el('span', { class: 'ok', text: 'Ranks 1-' + a.ranked + ' · values non-rising · every row carries a 6-step farm plan.' })
+      el('span', { class: 'ok', text: 'Ranks 1-' + a.ranked + ' - values non-rising - every value carries its 80% range from held-out residuals - every row carries a 6-step farm plan.' })
     );
   }
 
@@ -244,7 +256,12 @@
         el('td', { class: 'num odds', text: fmtOdds(r.token_odds) }),
         el('td', null, el('div', { class: 'implied' },
           el('div', { class: 'bar', 'aria-hidden': 'true' }, el('i', { style: 'width:' + Math.max(3, Math.round((r.implied_value_usd / max) * 100)) + '%' })),
-          el('span', { class: 'num', text: fmtUsd(r.implied_value_usd) })
+          el('span', { class: 'num', text: fmtUsd(r.implied_value_usd) }),
+          el('span', { class: 'sub', text: fmtUsd(r.value_low_usd) + ' to ' + fmtUsd(r.value_high_usd) })
+        )),
+        el('td', null, el('div', { class: 'implied' },
+          el('span', { class: 'num', text: fmtPerHour(r.farm_value_per_hour_usd) }),
+          el('span', { class: 'sub', text: 'min ' + fmtUsd(r.min_capital_usd) + ' - ' + fmtCost(r.farm_cost_usd) + ' gas' })
         )),
         el('td', null, el('span', { class: 'pill', text: 'no token' }))
       );
@@ -262,6 +279,7 @@
             sortHeader('age', 'Age'),
             sortHeader('odds', 'Odds'),
             sortHeader('implied', 'Implied value'),
+            sortHeader('farm', 'Farm $/h'),
             el('th', { scope: 'col', text: 'Token' })
           )),
           tbody
@@ -323,6 +341,17 @@
     var cvx = Math.pow(10, v.cv.median_abs_log10).toFixed(1);
     var basex = Math.pow(10, v.cv.baseline_median_abs_log10).toFixed(1);
     var wfx = Math.pow(10, v.walk_forward.median_abs_log10).toFixed(1);
+    var loox = Math.pow(10, v.loo.median_abs_log10).toFixed(1);
+    var bandx = Math.pow(10, v.range.global_half_width_log10).toFixed(1);
+    var pts = f.age_curve.points;
+    var young = pts[0], old = pts[pts.length - 1];
+    var ablRows = v.ablation.map(function (a) {
+      return el('tr', null,
+        el('td', { text: a.label }),
+        el('td', { class: 'num', text: Math.pow(10, a.median_abs_log10).toFixed(1) + 'x without it' }),
+        el('td', { class: 'num', text: a.kept ? 'kept' : 'no help on this test' })
+      );
+    });
     return el('section', { class: 'panel method' },
       el('h2', { text: 'How implied value is computed' }),
       el('p', { class: 'sub', text: 'Every row is scored by one fitted function of the snapshot figures. No protocol name is special-cased, and no row is hand-picked.' }),
@@ -331,19 +360,33 @@
         'conditional = 10^(...) x growth x maturity\n' +
         'growth = 1 + 0.25 x clamp(change_7d, -50, 100) / 100\n' +
         'maturity = 0.70 + 0.30 x min(ln(1 + age_days) / ln(1096), 1)\n' +
-        'implied = round(conditional x (0.6 + 0.8 x odds))'
+        'odds = category odds x ageFactor(age_days)\n' +
+        'implied = round(conditional x (0.6 + 0.8 x odds))\n' +
+        'range = implied widened by 10^(+/- category band) from held-out residuals'
       ),
-      el('p', { class: 'sub', text: 'The size curve is a least-squares fit of market cap on TVL across the ' + f.n_fit + ' live-token protocols that carry a positive market cap; the slope below 1 is the sublinear size curve. Each category shifts the line by its median residual, shrunk toward zero. Launch odds are the share of protocols at or above the $50M floor in the same category that already trade (global ' + fmtOdds(f.global_odds) + '), shrunk toward the global share. Age is the time since the protocol was first listed; an unknown age takes the pre-token median of ' + f.median_pre_age + ' days.' }),
+      el('p', { class: 'sub', text: 'The size curve is a least-squares fit of market cap on TVL across the ' + f.n_fit + ' live-token protocols that carry a positive market cap; the slope below 1 is the sublinear size curve. Each category shifts the line by its median residual, shrunk toward zero. Launch odds start from the share of protocols at or above the $50M floor in the same category that already trade (global ' + fmtOdds(f.global_odds) + '), shrunk toward the global share.' }),
+      el('p', { class: 'sub', text: 'The odds then decay with age. A survival curve fitted on all ' + f.age_curve.population + ' dated protocols reads the share still pre-token at each age; the oldest protocols put the never-launch floor at ' + Math.round(f.age_curve.s_inf * 100) + '%, and what remains of a protocol\u2019s launch window at its age, relative to the pre-token average, is its age factor: x' + young.factor.toFixed(2) + ' at ' + fmtAge(young.age) + ', x' + old.factor.toFixed(2) + ' at ' + fmtAge(old.age) + '. The longer a protocol has sat pre-token, the less of its launch window is left. Age is the time since the protocol was first listed; an unknown age takes the pre-token median of ' + f.median_pre_age + ' days.' }),
       el('h3', { text: 'Validation, computed at build time on protocols the fit had not seen' }),
+      el('p', { class: 'sub', text: 'Each scheme scores the board\u2019s exact printed number (the full implied value, odds included) for a live-token protocol treated as if it were pre-token, against its real market cap. Every fit inside a split sees only that split\u2019s training protocols.' }),
       el('div', { class: 'table-wrap' }, el('table', null,
         el('tbody', null,
           el('tr', null, el('td', { text: '5-fold cross-validation, median error' }), el('td', { class: 'num', text: cvx + 'x (median |log10 error| ' + v.cv.median_abs_log10 + ')' })),
           el('tr', null, el('td', { text: 'Cross-validation, predictions within 2x of the market cap' }), el('td', { class: 'num', text: Math.round(v.cv.within_2x * 100) + '% of ' + v.cv.n })),
           el('tr', null, el('td', { text: 'Same folds under a flat 0.25xTVL rule' }), el('td', { class: 'num', text: basex + 'x median error' })),
-          el('tr', null, el('td', { text: 'Walk-forward: fitted before ' + v.walk_forward.cutoff + ', tested after' }), el('td', { class: 'num', text: wfx + 'x median error, ' + Math.round(v.walk_forward.within_2x * 100) + '% within 2x (' + v.walk_forward.test_n + ' tested)' }))
+          el('tr', null, el('td', { text: 'Walk-forward: fitted on protocols listed before ' + v.walk_forward.cutoff + ', tested after' }), el('td', { class: 'num', text: wfx + 'x median error, ' + Math.round(v.walk_forward.within_2x * 100) + '% within 2x (' + v.walk_forward.test_n + ' tested)' })),
+          el('tr', null, el('td', { text: 'Leave-one-out: every protocol predicted by a fit that never saw it' }), el('td', { class: 'num', text: loox + 'x median error, ' + Math.round(v.loo.within_2x * 100) + '% within 2x (' + v.loo.n + ' tested)' })),
+          el('tr', null, el('td', { text: 'Value range: the 80% band from cross-validated residuals' }), el('td', { class: 'num', text: 'x/' + bandx + ' typical, and it held ' + Math.round(v.range.coverage * 100) + '% of held-out market caps' }))
         )
       )),
-      el('p', { class: 'sub', text: 'Read the validation honestly: the fitted model beats a flat multiple, but market caps vary widely around TVL, so an implied value is an order-of-magnitude estimate, not a price. The validation scores the conditional value only; the odds term is a separate peer-rate adjustment, shown as its own column.' })
+      el('h3', { text: 'Ablation: each term removed in turn, same folds' }),
+      el('div', { class: 'table-wrap' }, el('table', null,
+        el('thead', null, el('tr', null, el('th', { scope: 'col', text: 'Term' }), el('th', { scope: 'col', text: 'Median error without it' }), el('th', { scope: 'col', text: 'Verdict' }))),
+        el('tbody', null, ablRows)
+      )),
+      el('p', { class: 'sub', text: 'Read the ablation honestly: it tests each term as a predictor of market caps that already exist. The odds terms are probability weights, not value predictors: they exist to rank farms by expected value, and this test is not what they are for. The growth and maturity terms move a row by at most a quarter and a third; the fitted line and the category adjustment carry the value.' }),
+      el('h3', { text: 'Farm economics' }),
+      el('p', { class: 'sub', text: 'Each plan\u2019s cost is its gas alone (the position capital stays in the position), and its hours are the steps\u2019 own times over the hold. The $/hour figure is a stated scenario, not a forecast: if a launch values the protocol at its implied value and pays 5% of that to early users, split evenly over 10,000 qualifying wallets, the expected value is the launch odds times that share, divided by the plan\u2019s hours. Most launches pay nothing like it; many pay nothing at all.' }),
+      el('p', { class: 'sub', text: 'Read the validation honestly: the fitted model beats a flat multiple, but market caps vary widely around TVL, so an implied value is an order-of-magnitude estimate with the range printed beside it, not a price.' })
     );
   }
 
@@ -384,7 +427,10 @@
         el('div', null, el('span', { text: 'Age with no token' }), el('b', { class: 'num', text: fmtAge(row.age_days) + ' (x' + row.maturity_multiplier.toFixed(2) + ')' })),
         el('div', null, el('span', { text: 'Conditional value' }), el('b', { class: 'num', text: fmtUsd(row.conditional_value_usd) })),
         el('div', null, el('span', { text: 'Launch odds' }), el('b', { class: 'num odds', text: fmtOdds(row.token_odds) + ' (x' + row.odds_multiplier.toFixed(2) + ')' })),
-        el('div', { class: 'total' }, el('span', { text: 'Implied value' }), el('b', { class: 'num', text: fmtUsd(row.implied_value_usd) }))
+        el('div', null, el('span', { text: 'Odds from the peers' }), el('b', { class: 'num', text: fmtOdds(row.odds_base) + ' in ' + (row.category || 'Uncategorised') })),
+        el('div', null, el('span', { text: 'Odds age factor (' + fmtAge(row.age_days) + ' pre-token)' }), el('b', { class: 'num', text: 'x' + row.odds_age_factor.toFixed(2) })),
+        el('div', { class: 'total' }, el('span', { text: 'Implied value' }), el('b', { class: 'num', text: fmtUsd(row.implied_value_usd) })),
+        el('div', null, el('span', { text: 'Value range (80% band)' }), el('b', { class: 'num', text: fmtUsd(row.value_low_usd) + ' to ' + fmtUsd(row.value_high_usd) }))
       ),
       el('p', { class: 'sub', text: 'Model ' + DATA.model_version + ': the page recomputes this row as ' + fmtUsd(recomputed.implied) + (agrees ? ', the same number board.json carries.' : ', which differs from the board: the data would be stale.') + ' This is an estimate, not a price.' })
     ));
@@ -394,6 +440,7 @@
     ));
     dialog.appendChild(el('section', { class: 'detail-section' },
       el('h3', { text: 'Farm plan' }),
+      el('p', { class: 'sub', text: 'Plan economics: about ' + fmtCost(row.farm_cost_usd) + ' of gas over ' + row.farm_hours.toFixed(1) + ' hours of effort. Scenario expected value ' + fmtUsd(row.farm_expected_usd) + ' (' + fmtPerHour(row.farm_value_per_hour_usd) + ') if a launch pays early users 5% of the implied value split over 10,000 wallets: an estimate under that stated scenario, not a promise.' }),
       el('ol', { class: 'steps' }, steps.map(function (s) {
         var at = s.indexOf(' Cost: ');
         var action = at >= 0 ? s.slice(0, at) : s;
@@ -420,7 +467,7 @@
   function footer() {
     return el('footer', { class: 'foot' },
       el('p', { text: 'Snapshot: ' + DATA.source + '. "No token" means the record carries no token: a protocol on the board may still have a token its DefiLlama record does not carry. Implied values are the entry\u2019s own model, never a price, and never a prediction of whether or when a token is issued.' }),
-      el('p', { text: 'Model ' + DATA.model_version + ': log10(mcap) = ' + DATA.fit.intercept + ' + ' + DATA.fit.slope + ' log10(tvl) + peer adjustment, fitted on ' + DATA.fit.n_fit + ' live-token protocols; 5-fold cross-validated median error ' + Math.pow(10, DATA.validation.cv.median_abs_log10).toFixed(1) + 'x.' })
+      el('p', { text: 'Model ' + DATA.model_version + ': log10(mcap) = ' + DATA.fit.intercept + ' + ' + DATA.fit.slope + ' log10(tvl) + peer adjustment, launch odds decayed by a survival curve over age, fitted on ' + DATA.fit.n_fit + ' live-token protocols; 5-fold cross-validated median error ' + Math.pow(10, DATA.validation.cv.median_abs_log10).toFixed(1) + 'x on the full printed number.' })
     );
   }
 

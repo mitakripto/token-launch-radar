@@ -20,14 +20,28 @@
 //   age      0.70 + 0.30 * min(ln(1 + age_days) / ln(1096), 1): a protocol that has run longer with
 //            no token is read as more mature. Unknown age takes the pre-token median age.
 //   odds     the share of protocols at or above the floor in the same category that already trade,
-//            shrunk toward the global share: how often the peers launched. oddsMult = 0.6 + 0.8*odds.
+//            shrunk toward the global share: how often the peers launched. v2 then ages those odds:
+//            a survival curve fitted on every dated protocol in the snapshot (the share still
+//            pre-token at each age, made non-increasing) gives the chance a protocol that is still
+//            pre-token at a given age ever launches, and each row's odds are multiplied by that
+//            chance relative to its average over the pre-token population. The longer a protocol
+//            has sat pre-token, the lower its odds: most of its launch window is behind it.
+//            oddsMult = 0.6 + 0.8 * odds.
 //   implied  round(10^(a + b*log10(tvl) + peerAdj) * growth * age * oddsMult), at least $1.
+//   range    every row also carries a value range: the implied value widened by a per-category
+//            band whose half-width is the 80th percentile of that category's cross-validated
+//            residuals (shrunk toward the global band), so a row's range is as honest as the
+//            model's own held-out record in that category, no tighter.
 //
-// Validation is computed at build time, on the live-token protocols only, and reported honestly:
-// five-fold cross-validation (folds by a hash of the slug, so they are deterministic) and a
-// walk-forward split by listing date, each against the same folds scored with a flat 0.25xTVL rule.
-// The validation scores the conditional value (size, peers, growth, age); the odds term is a
-// separate peer-rate adjustment and is shown as its own column, never hidden inside the value.
+// Validation is computed at build time, on the live-token protocols only, and reported honestly.
+// It scores the board's exact printed number (the full implied value, odds included) for a
+// live-token protocol treated as if it were pre-token, against its actual market cap: the
+// strictest test of the printed figure. Four schemes: five-fold cross-validation (folds by a
+// hash of the slug, so they are deterministic), a walk-forward split by listing date,
+// leave-one-out over every fitted protocol, and a per-term ablation under the same folds (each
+// term removed in turn; a term is kept when removing it raises the held-out error). Every fit
+// inside a validation fold sees only that fold's training protocols. The flat 0.25xTVL rule is
+// scored on the same folds as the baseline.
 
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -52,6 +66,18 @@ export interface Snapshot {
   watchlist: string[];
 }
 
+/** The launch-odds age curve: how the chance of ever launching falls with time spent pre-token. */
+export interface AgeCurve {
+  /** Breakpoints of the age factor: interpolate linearly in ln(1 + age) between them. */
+  points: Array<{ age: number; factor: number }>;
+  /** The pre-token share among the oldest protocols: the fitted never-launch floor of the curve. */
+  s_inf: number;
+  /** The curve's mean ever-launch chance over the dated pre-token population (the factor's 1.0). */
+  mean_ever: number;
+  /** How many dated protocols the curve was fitted on. */
+  population: number;
+}
+
 /** The fitted value model's parameters, all derived from the snapshot at build time. */
 export interface FitParams {
   intercept: number;
@@ -65,6 +91,7 @@ export interface FitParams {
   odds: Record<string, number>;
   odds_n: Record<string, number>;
   global_odds: number;
+  age_curve: AgeCurve;
   median_pre_age: number;
 }
 
@@ -76,14 +103,35 @@ export interface ValidationRun {
   baseline_median_abs_log10: number;
 }
 
-/** The model's validation: cross-validation, walk-forward, and the baseline they beat. */
+/** One ablation row: the held-out error with one term removed, and whether the term earns its place. */
+export interface AblationRow {
+  term: string;
+  label: string;
+  median_abs_log10: number;
+  kept: boolean;
+}
+
+/** The model's validation: cross-validation, walk-forward, leave-one-out and the term ablation. */
 export interface Validation {
   cv: ValidationRun;
   walk_forward: { train_n: number; test_n: number; cutoff: string; median_abs_log10: number; within_2x: number };
+  loo: { n: number; median_abs_log10: number; within_2x: number };
+  ablation: AblationRow[];
+  range: { global_half_width_log10: number; coverage: number; level: number };
+}
+
+/** Switches that turn model terms off, for the ablation: the shipped model runs with all on. */
+export interface TermFlags {
+  base?: boolean;
+  peer?: boolean;
+  growth?: boolean;
+  maturity?: boolean;
+  odds?: boolean;
+  age_decay?: boolean;
 }
 
 /** The model's version label: the dashboard names it. */
-export const MODEL_VERSION = 'radar-fit-1';
+export const MODEL_VERSION = 'radar-fit-2';
 
 /** The flat rule the validation compares against: the starter's 0.25xTVL. */
 const BASELINE_MULTIPLE = 0.25;
@@ -95,6 +143,19 @@ const ODDS_SHRINK = 8;
 const PEER_CLAMP = 0.5;
 /** Folds for cross-validation. */
 const FOLDS = 5;
+/** Age buckets (days) for the launch-odds survival curve. */
+const AGE_BUCKET_EDGES = [0, 90, 180, 365, 730, 1095, 1460, Number.POSITIVE_INFINITY];
+/** The age factor's bounds: a stated calibration choice, so no age reads as hopeless or certain. */
+const AGE_FACTOR_MIN = 0.35;
+const AGE_FACTOR_MAX = 1.3;
+/** Shrinkage strength for a category's range band (pseudo-count of residuals). */
+const RANGE_SHRINK = 4;
+/** The range band's level: the 80th percentile of held-out residuals. */
+const RANGE_LEVEL = 0.8;
+/** Farm scenario: the share of a launch's implied value assumed to reach early users. */
+export const FARM_REWARD_SHARE = 0.05;
+/** Farm scenario: the qualifying wallets that share is divided among. */
+export const FARM_ASSUMED_WALLETS = 10_000;
 
 const DAY_MS = 86_400_000;
 
@@ -238,21 +299,6 @@ function maturityTerm(age: number | null, fallbackAge: number): { age_used: numb
   return { age_used: ageUsed, mult };
 }
 
-/** A protocol's conditional value under a fitted model: size, peers, growth and age, before odds. */
-function conditionalValue(
-  p: SnapshotProtocol,
-  asOf: string,
-  fit: { intercept: number; slope: number; peer_adj: Record<string, number> },
-  fallbackAge: number,
-): { conditional: number; growth: number; maturity: number; age: number | null } {
-  const age = ageDays(asOf, p.listed_at);
-  const growth = growthTerm(p.change_7d);
-  const maturity = maturityTerm(age, fallbackAge);
-  const adj = fit.peer_adj[catKey(p)] ?? 0;
-  const conditional = Math.pow(10, fit.intercept + fit.slope * Math.log10(Math.max(p.tvl_usd, 1)) + adj) * growth.mult * maturity.mult;
-  return { conditional, growth: growth.mult, maturity: maturity.mult, age };
-}
-
 /**
  * Launch odds per category: among protocols at or above the floor in the category, the share that
  * already trade, shrunk toward the global share. Categories with no protocol at the floor take the
@@ -279,6 +325,73 @@ function fitOdds(protocols: SnapshotProtocol[], floorUsd: number): { odds: Recor
   return { odds, odds_n, global_odds: round4(global) };
 }
 
+/**
+ * The launch-odds age curve, fitted on every dated protocol in the population. In each age bucket,
+ * S is the share still pre-token; made non-increasing across buckets, it is the survival curve of
+ * "no launch yet". The oldest bucket's S is the never-launch floor S_inf, and a protocol still
+ * pre-token at age a has ever-launch chance (S(a) - S_inf) / S(a): what is left of its launch
+ * window. The age factor is that chance relative to its mean over the dated pre-token population,
+ * clamped to [AGE_FACTOR_MIN, AGE_FACTOR_MAX], at each bucket's median age.
+ */
+function fitAgeCurve(protocols: SnapshotProtocol[], asOf: string): AgeCurve {
+  const dated = protocols
+    .map((p) => ({ age: ageDays(asOf, p.listed_at), pre: isPreToken(p) }))
+    .filter((d): d is { age: number; pre: boolean } => d.age !== null);
+  const buckets: Array<{ ages: number[]; n: number; pre: number }> = [];
+  for (let i = 0; i + 1 < AGE_BUCKET_EDGES.length; i++) {
+    const lo = AGE_BUCKET_EDGES[i]!;
+    const hi = AGE_BUCKET_EDGES[i + 1]!;
+    const members = dated.filter((d) => d.age >= lo && d.age < hi);
+    buckets.push({ ages: members.map((d) => d.age), n: members.length, pre: members.filter((d) => d.pre).length });
+  }
+  const shares: number[] = [];
+  let prev = 1;
+  for (const b of buckets) {
+    const s = b.n === 0 ? prev : Math.min(prev, b.pre / b.n);
+    shares.push(s);
+    prev = s;
+  }
+  const sInf = shares[shares.length - 1] ?? 0;
+  const ever = shares.map((s) => (s > 0 ? Math.max(0, (s - sInf) / s) : 0));
+  const preAges = dated.filter((d) => d.pre);
+  let meanEver = 0;
+  if (preAges.length > 0) {
+    let sum = 0;
+    for (const d of preAges) {
+      const bi = AGE_BUCKET_EDGES.findIndex((_, i) => i + 1 < AGE_BUCKET_EDGES.length && d.age >= AGE_BUCKET_EDGES[i]! && d.age < AGE_BUCKET_EDGES[i + 1]!);
+      sum += ever[Math.max(0, bi)]!;
+    }
+    meanEver = sum / preAges.length;
+  }
+  const points = buckets.map((b, i) => {
+    const med = median(b.ages);
+    const lo = AGE_BUCKET_EDGES[i]!;
+    const hi = AGE_BUCKET_EDGES[i + 1]!;
+    const age = med !== null ? Math.round(med) : Math.round(Number.isFinite(hi) ? Math.sqrt(lo * hi) : lo * 1.25);
+    const factor = meanEver > 0 ? Math.max(AGE_FACTOR_MIN, Math.min(AGE_FACTOR_MAX, ever[i]! / meanEver)) : 1;
+    return { age, factor: round4(factor) };
+  });
+  points.sort((a, b) => a.age - b.age);
+  return { points, s_inf: round4(sInf), mean_ever: round4(meanEver), population: dated.length };
+}
+
+/** The age factor at an age: linear in ln(1 + age) between the curve's points, flat outside them. */
+export function ageFactorAt(curve: AgeCurve, age: number): number {
+  const pts = curve.points;
+  if (pts.length === 0) return 1;
+  if (age <= pts[0]!.age) return pts[0]!.factor;
+  if (age >= pts[pts.length - 1]!.age) return pts[pts.length - 1]!.factor;
+  for (let i = 1; i < pts.length; i++) {
+    if (age <= pts[i]!.age) {
+      const a = pts[i - 1]!;
+      const b = pts[i]!;
+      const t = (Math.log1p(age) - Math.log1p(a.age)) / Math.max(Math.log1p(b.age) - Math.log1p(a.age), 1e-9);
+      return a.factor + t * (b.factor - a.factor);
+    }
+  }
+  return pts[pts.length - 1]!.factor;
+}
+
 /** Fit the whole model on the snapshot: value fit, odds, and the pre-token median age. The line's
  * parameters are rounded to 4 decimals here, so the dashboard (which reads the rounded values from
  * data.js) recomputes exactly the implied values this model scores: the page and board.json agree
@@ -288,12 +401,13 @@ export function fitModel(snapshot: Snapshot): FitParams {
   value.intercept = round4(value.intercept);
   value.slope = round4(value.slope);
   const odds = fitOdds(snapshot.protocols, snapshot.floor_usd);
+  const ageCurve = fitAgeCurve(snapshot.protocols, snapshot.as_of);
   const preAges = snapshot.protocols
     .filter(isPreToken)
     .map((p) => ageDays(snapshot.as_of, p.listed_at))
     .filter((a): a is number => a !== null);
   const medianPreAge = median(preAges) ?? 365;
-  return { ...value, ...odds, median_pre_age: Math.round(medianPreAge) };
+  return { ...value, ...odds, age_curve: ageCurve, median_pre_age: Math.round(medianPreAge) };
 }
 
 // ---------------------------------------------------------------- validation
@@ -306,40 +420,122 @@ function scorePredictions(pairs: Array<{ actual: number; predicted: number }>): 
   return { median_abs_log10: round4(med), within_2x: round4(within) };
 }
 
+/** The nearest-rank quantile of an ascending-sorted list. */
+function quantile(sortedAsc: number[], q: number): number {
+  if (sortedAsc.length === 0) return 0;
+  return sortedAsc[Math.min(sortedAsc.length - 1, Math.max(0, Math.ceil(q * sortedAsc.length) - 1))]!;
+}
+
+/** One held-out prediction: a live-token protocol, its category, its market cap and the model's number. */
+export interface CvPair {
+  slug: string;
+  category: string;
+  actual: number;
+  predicted: number;
+}
+
+/** A snapshot like the sealed one, but holding only `protocols`: the training side of a split. */
+function subSnapshot(snapshot: Snapshot, protocols: SnapshotProtocol[]): Snapshot {
+  return { ...snapshot, protocols };
+}
+
 /**
- * Validate the fitted model on the live-token protocols it was fitted on, honestly: five-fold
- * cross-validation (each fold's fit sees only the other folds) and a walk-forward split by listing
- * date (fit on the earlier-listed half, tested on the later-listed half). Both are scored against
- * the same folds under a flat 0.25xTVL rule, so the reader can see what fitting buys.
+ * Five-fold cross-validated predictions of the full implied value for every fitted protocol:
+ * each fold's model is fitted on the other folds' protocols alone (value line, peer figures,
+ * launch odds and the age curve alike), then asked for the printed number of each held-out
+ * protocol, as if it were pre-token.
  */
-export function validateModel(snapshot: Snapshot, fit: FitParams): Validation {
+export function crossValidatePairs(snapshot: Snapshot, terms: TermFlags = {}): CvPair[] {
   const rows = fitSet(snapshot.protocols);
-  const cvPairs: Array<{ actual: number; predicted: number }> = [];
-  const cvBase: Array<{ actual: number; predicted: number }> = [];
+  const pairs: CvPair[] = [];
   for (let fold = 0; fold < FOLDS; fold++) {
-    const train = rows.filter((p) => hash32(p.slug) % FOLDS !== fold);
+    const train = snapshot.protocols.filter((p) => hash32(p.slug) % FOLDS !== fold);
     const test = rows.filter((p) => hash32(p.slug) % FOLDS === fold);
-    const foldFit = fitValueModel(train);
+    const foldFit = fitModel(subSnapshot(snapshot, train));
     for (const p of test) {
-      const { conditional } = conditionalValue(p, snapshot.as_of, foldFit, fit.median_pre_age);
-      cvPairs.push({ actual: p.mcap_usd!, predicted: conditional });
-      cvBase.push({ actual: p.mcap_usd!, predicted: p.tvl_usd * BASELINE_MULTIPLE });
+      pairs.push({ slug: p.slug, category: catKey(p), actual: p.mcap_usd!, predicted: scoreProtocol(p, snapshot, foldFit, terms).implied });
     }
   }
+  return pairs;
+}
+
+/**
+ * The value range's half-widths, in log10, from cross-validated residuals: per category, the
+ * RANGE_LEVEL quantile of |residual|, shrunk toward the global quantile by the category's
+ * residual count. Categories with no fitted protocol take the global width.
+ */
+export function rangeHalfWidths(pairs: CvPair[]): { per_cat: Record<string, number>; global: number } {
+  const byCat: Record<string, number[]> = {};
+  const all: number[] = [];
+  for (const pr of pairs) {
+    const r = Math.abs(Math.log10(Math.max(pr.actual, 1) / Math.max(pr.predicted, 1)));
+    (byCat[pr.category] ??= []).push(r);
+    all.push(r);
+  }
+  const global = quantile([...all].sort((a, b) => a - b), RANGE_LEVEL);
+  const per_cat: Record<string, number> = {};
+  for (const key of Object.keys(byCat).sort()) {
+    const rs = [...byCat[key]!].sort((a, b) => a - b);
+    const q = quantile(rs, RANGE_LEVEL);
+    per_cat[key] = round4((rs.length * q + RANGE_SHRINK * global) / (rs.length + RANGE_SHRINK));
+  }
+  return { per_cat, global: round4(global) };
+}
+
+/**
+ * Validate the model on the live-token protocols, honestly, under four schemes, every fit inside
+ * a split seeing only that split's training protocols: five-fold cross-validation, a
+ * walk-forward split by listing date, leave-one-out, and a per-term ablation under the same
+ * folds. The scored prediction is the board's printed number, the full implied value.
+ */
+export function validateModel(snapshot: Snapshot): { validation: Validation; half_widths: { per_cat: Record<string, number>; global: number } } {
+  const rows = fitSet(snapshot.protocols);
+  const cvPairs = crossValidatePairs(snapshot);
   const cvScore = scorePredictions(cvPairs);
-  const cvBaseline = scorePredictions(cvBase);
+  const basePairs = rows.map((p) => ({ actual: p.mcap_usd!, predicted: p.tvl_usd * BASELINE_MULTIPLE }));
+  const cvBaseScore = scorePredictions(basePairs);
 
   const dated = rows.filter((p) => p.listed_at !== null).sort((a, b) => (a.listed_at! < b.listed_at! ? -1 : a.listed_at! > b.listed_at! ? 1 : 0));
   const cutoff = dated.length === 0 ? snapshot.as_of : dated[Math.floor(dated.length / 2)]!.listed_at!;
-  const train = dated.filter((p) => p.listed_at! < cutoff);
-  const test = dated.filter((p) => p.listed_at! >= cutoff);
-  const wfFit = fitValueModel(train.length > 0 ? train : rows);
-  const wfPairs = test.map((p) => ({ actual: p.mcap_usd!, predicted: conditionalValue(p, snapshot.as_of, wfFit, fit.median_pre_age).conditional }));
-  const wfScore = scorePredictions(wfPairs);
+  const wfTrainProtos = snapshot.protocols.filter((p) => p.listed_at !== null && p.listed_at < cutoff);
+  const wfTest = dated.filter((p) => p.listed_at! >= cutoff);
+  const wfFit = fitModel(subSnapshot(snapshot, wfTrainProtos.length > 0 ? wfTrainProtos : snapshot.protocols));
+  const wfScore = scorePredictions(wfTest.map((p) => ({ actual: p.mcap_usd!, predicted: scoreProtocol(p, snapshot, wfFit).implied })));
+
+  const looPairs: Array<{ actual: number; predicted: number }> = [];
+  for (const p of rows) {
+    const rest = snapshot.protocols.filter((q) => q.slug !== p.slug);
+    const looFit = fitModel(subSnapshot(snapshot, rest));
+    looPairs.push({ actual: p.mcap_usd!, predicted: scoreProtocol(p, snapshot, looFit).implied });
+  }
+  const looScore = scorePredictions(looPairs);
+
+  const ablationSpecs: Array<{ term: string; label: string; terms: TermFlags }> = [
+    { term: 'base', label: 'Fitted TVL line (raw peer multiples instead)', terms: { base: false } },
+    { term: 'peer', label: 'Category peer adjustment', terms: { peer: false } },
+    { term: 'growth', label: 'Seven-day growth term', terms: { growth: false } },
+    { term: 'maturity', label: 'Age maturity term', terms: { maturity: false } },
+    { term: 'odds', label: 'Launch odds term', terms: { odds: false } },
+    { term: 'age_decay', label: 'Odds age decay', terms: { age_decay: false } },
+  ];
+  const ablation: AblationRow[] = ablationSpecs.map((spec) => {
+    const score = scorePredictions(crossValidatePairs(snapshot, spec.terms));
+    return { term: spec.term, label: spec.label, median_abs_log10: score.median_abs_log10, kept: cvScore.median_abs_log10 <= score.median_abs_log10 };
+  });
+
+  const half_widths = rangeHalfWidths(cvPairs);
+  const covered = cvPairs.filter((pr) => Math.abs(Math.log10(Math.max(pr.actual, 1) / Math.max(pr.predicted, 1))) <= (half_widths.per_cat[pr.category] ?? half_widths.global)).length;
+  const coverage = cvPairs.length === 0 ? 0 : round4(covered / cvPairs.length);
 
   return {
-    cv: { n: cvPairs.length, median_abs_log10: cvScore.median_abs_log10, within_2x: cvScore.within_2x, baseline_median_abs_log10: cvBaseline.median_abs_log10 },
-    walk_forward: { train_n: train.length, test_n: test.length, cutoff, median_abs_log10: wfScore.median_abs_log10, within_2x: wfScore.within_2x },
+    validation: {
+      cv: { n: cvPairs.length, median_abs_log10: cvScore.median_abs_log10, within_2x: cvScore.within_2x, baseline_median_abs_log10: cvBaseScore.median_abs_log10 },
+      walk_forward: { train_n: dated.length - wfTest.length, test_n: wfTest.length, cutoff, median_abs_log10: wfScore.median_abs_log10, within_2x: wfScore.within_2x },
+      loo: { n: looPairs.length, median_abs_log10: looScore.median_abs_log10, within_2x: looScore.within_2x },
+      ablation,
+      range: { global_half_width_log10: half_widths.global, coverage, level: RANGE_LEVEL },
+    },
+    half_widths,
   };
 }
 
@@ -369,9 +565,15 @@ export interface BoardRow {
   age_days: number | null;
   implied_value_usd: number;
   conditional_value_usd: number;
+  value_low_usd: number;
+  value_high_usd: number;
   token_odds: number;
   capital_usd: number;
   min_capital_usd: number;
+  farm_cost_usd: number;
+  farm_hours: number;
+  farm_expected_usd: number;
+  farm_value_per_hour_usd: number;
   model: {
     peer_multiple: number;
     peer_adj_log10: number;
@@ -379,6 +581,8 @@ export interface BoardRow {
     growth_multiplier: number;
     maturity_multiplier: number;
     odds_multiplier: number;
+    odds_base: number;
+    odds_age_factor: number;
     age_days: number | null;
   };
   farm_steps: string[];
@@ -397,9 +601,17 @@ export interface RadarRow {
   age_days: number | null;
   implied_value_usd: number;
   conditional_value_usd: number;
+  value_low_usd: number;
+  value_high_usd: number;
   token_odds: number;
+  odds_base: number;
+  odds_age_factor: number;
   capital_usd: number;
   min_capital_usd: number;
+  farm_cost_usd: number;
+  farm_hours: number;
+  farm_expected_usd: number;
+  farm_value_per_hour_usd: number;
   peer_multiple: number;
   growth_multiplier: number;
   maturity_multiplier: number;
@@ -461,6 +673,7 @@ export interface RadarData {
     global_median_multiple: number;
     global_odds: number;
     median_pre_age: number;
+    age_curve: AgeCurve;
   };
   validation: Validation;
   accounting: Accounting;
@@ -487,10 +700,13 @@ export function scoreProtocol(
   p: SnapshotProtocol,
   snapshot: Snapshot,
   fit: FitParams,
+  terms: TermFlags = {},
 ): {
   implied: number;
   conditional: number;
   odds: number;
+  oddsBase: number;
+  ageFactor: number;
   oddsMult: number;
   growthPct: number;
   growthMult: number;
@@ -503,17 +719,35 @@ export function scoreProtocol(
   const growth = growthTerm(p.change_7d);
   const maturity = maturityTerm(age, fit.median_pre_age);
   const key = catKey(p);
-  const peerAdj = fit.peer_adj[key] ?? 0;
+  const peerAdj = terms.peer === false ? 0 : (fit.peer_adj[key] ?? 0);
   const peerMultiple = fit.peer_multiple[key] ?? fit.global_median_multiple;
-  const conditional = Math.pow(10, fit.intercept + fit.slope * Math.log10(Math.max(p.tvl_usd, 1)) + peerAdj) * growth.mult * maturity.mult;
-  const odds = fit.odds[key] ?? fit.global_odds;
-  const oddsMult = 0.6 + 0.8 * odds;
+  const tvl = Math.max(p.tvl_usd, 1);
+  const line = Math.pow(10, fit.intercept + fit.slope * Math.log10(tvl) + peerAdj);
+  const base = terms.base === false ? peerMultiple * tvl : line;
+  const conditional = base * (terms.growth === false ? 1 : growth.mult) * (terms.maturity === false ? 1 : maturity.mult);
+  const oddsBase = fit.odds[key] ?? fit.global_odds;
+  const ageFactor = terms.age_decay === false ? 1 : ageFactorAt(fit.age_curve, age ?? fit.median_pre_age);
+  const odds = Math.min(0.97, Math.max(0.01, round4(oddsBase * ageFactor)));
+  const oddsMult = terms.odds === false ? 1 : 0.6 + 0.8 * odds;
   const implied = Math.max(1, Math.min(100_000_000_000_000, Math.round(conditional * oddsMult)));
-  return { implied, conditional: Math.max(1, Math.round(conditional)), odds, oddsMult: round4(oddsMult), growthPct: growth.pct, growthMult: round4(growth.mult), maturityMult: round4(maturity.mult), age, peerMultiple, peerAdj };
+  return {
+    implied,
+    conditional: Math.max(1, Math.round(conditional)),
+    odds,
+    oddsBase: round4(oddsBase),
+    ageFactor: round4(ageFactor),
+    oddsMult: round4(oddsMult),
+    growthPct: growth.pct,
+    growthMult: round4(growth.mult),
+    maturityMult: round4(maturity.mult),
+    age,
+    peerMultiple,
+    peerAdj,
+  };
 }
 
 /** The protocols the board ranks, strongest first, with ranks 1..n. */
-export function buildBoard(snapshot: Snapshot, fit: FitParams): BoardRow[] {
+export function buildBoard(snapshot: Snapshot, fit: FitParams, halfWidths: { per_cat: Record<string, number>; global: number }): BoardRow[] {
   const index = bySlug(snapshot.protocols);
   const chosen = new Map<string, SnapshotProtocol>();
   // The watchlist is the floor: every slug it names, whatever else the board holds.
@@ -527,36 +761,50 @@ export function buildBoard(snapshot: Snapshot, fit: FitParams): BoardRow[] {
   }
   const scored = [...chosen.values()].map((p) => ({ p, s: scoreProtocol(p, snapshot, fit) }));
   scored.sort((a, b) => b.s.implied - a.s.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
-  return scored.map(({ p, s }, i) => ({
-    rank: i + 1,
-    slug: p.slug,
-    name: p.name,
-    category: p.category,
-    chains: p.chains,
-    tvl_usd: p.tvl_usd,
-    change_7d: p.change_7d,
-    mcap_usd: p.mcap_usd,
-    listed_at: p.listed_at,
-    gecko_id: p.gecko_id,
-    symbol: p.symbol,
-    token_status: 'pre-token',
-    age_days: s.age,
-    implied_value_usd: s.implied,
-    conditional_value_usd: s.conditional,
-    token_odds: s.odds,
-    capital_usd: capitalFor(p),
-    min_capital_usd: minCapitalFor(p),
-    model: {
-      peer_multiple: s.peerMultiple,
-      peer_adj_log10: s.peerAdj,
-      growth_pct: s.growthPct,
-      growth_multiplier: s.growthMult,
-      maturity_multiplier: s.maturityMult,
-      odds_multiplier: s.oddsMult,
+  return scored.map(({ p, s }, i) => {
+    const h = halfWidths.per_cat[catKey(p)] ?? halfWidths.global;
+    const low = Math.min(s.implied, Math.max(1, Math.round(s.implied * Math.pow(10, -h))));
+    const high = Math.max(s.implied, Math.min(100_000_000_000_000, Math.round(s.implied * Math.pow(10, h))));
+    const econ = farmEconomics(p, s.age, s.implied, s.odds);
+    return {
+      rank: i + 1,
+      slug: p.slug,
+      name: p.name,
+      category: p.category,
+      chains: p.chains,
+      tvl_usd: p.tvl_usd,
+      change_7d: p.change_7d,
+      mcap_usd: p.mcap_usd,
+      listed_at: p.listed_at,
+      gecko_id: p.gecko_id,
+      symbol: p.symbol,
+      token_status: 'pre-token' as const,
       age_days: s.age,
-    },
-    farm_steps: farmSteps(p, s.age).map(stepText),
-  }));
+      implied_value_usd: s.implied,
+      conditional_value_usd: s.conditional,
+      value_low_usd: low,
+      value_high_usd: high,
+      token_odds: s.odds,
+      capital_usd: capitalFor(p),
+      min_capital_usd: minCapitalFor(p),
+      farm_cost_usd: econ.cost_usd,
+      farm_hours: econ.hours,
+      farm_expected_usd: econ.expected_usd,
+      farm_value_per_hour_usd: econ.value_per_hour_usd,
+      model: {
+        peer_multiple: s.peerMultiple,
+        peer_adj_log10: s.peerAdj,
+        growth_pct: s.growthPct,
+        growth_multiplier: s.growthMult,
+        maturity_multiplier: s.maturityMult,
+        odds_multiplier: s.oddsMult,
+        odds_base: s.oddsBase,
+        odds_age_factor: s.ageFactor,
+        age_days: s.age,
+      },
+      farm_steps: farmSteps(p, s.age).map(stepText),
+    };
+  });
 }
 
 // ---------------------------------------------------------------- farm plans
@@ -679,6 +927,44 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
   ];
 }
 
+/** Gas in dollars, the numbers behind gasFor's words: the stated bound of each phrase. */
+function gasUsdFor(chain: string): { setup: number; weekly: number } {
+  if (chain === 'Ethereum') return { setup: 8, weekly: 4 };
+  if (chain === 'Solana' || chain === 'Sui' || chain === 'Aptos' || chain === 'Near' || chain === 'Sei') return { setup: 0.1, weekly: 0.05 };
+  return { setup: 1, weekly: 0.5 };
+}
+
+/**
+ * A farm plan's economics, from the plan's own steps: the out-of-pocket cost (gas only; the
+ * position capital stays in the position and is not a cost), the total hours of effort, and a
+ * scenario expected value. The scenario is stated, not hidden: if the token launches at the
+ * row's implied value, FARM_REWARD_SHARE of that value reaches early users, split evenly among
+ * FARM_ASSUMED_WALLETS qualifying wallets; the expected value weights that by the row's launch
+ * odds, and $/hour divides it by the plan's hours. An estimate under a stated scenario, never
+ * a promise: most launches pay nothing like it, and many pay nothing at all.
+ */
+export function farmEconomics(
+  p: SnapshotProtocol,
+  age: number | null,
+  implied: number,
+  odds: number,
+): { cost_usd: number; hours: number; expected_usd: number; value_per_hour_usd: number; hold_days: number; weeks: number } {
+  const gas = gasUsdFor(chainOf(p));
+  const hold = holdDaysFor(age);
+  const weeks = Math.max(1, Math.ceil(hold / 7));
+  const cost = 2 * gas.setup + weeks * gas.weekly;
+  const hours = (45 + 10 * weeks) / 60;
+  const expected = (odds * FARM_REWARD_SHARE * implied) / FARM_ASSUMED_WALLETS;
+  return {
+    cost_usd: round2(cost),
+    hours: round2(hours),
+    expected_usd: round2(expected),
+    value_per_hour_usd: round2(expected / hours),
+    hold_days: hold,
+    weeks,
+  };
+}
+
 // ---------------------------------------------------------------- the radar
 
 /** The live-token protocols, by market cap, for the dashboard's Live token view. */
@@ -772,9 +1058,17 @@ export function radarRow(row: BoardRow): RadarRow {
     age_days: row.age_days,
     implied_value_usd: row.implied_value_usd,
     conditional_value_usd: row.conditional_value_usd,
+    value_low_usd: row.value_low_usd,
+    value_high_usd: row.value_high_usd,
     token_odds: row.token_odds,
+    odds_base: row.model.odds_base,
+    odds_age_factor: row.model.odds_age_factor,
     capital_usd: row.capital_usd,
     min_capital_usd: row.min_capital_usd,
+    farm_cost_usd: row.farm_cost_usd,
+    farm_hours: row.farm_hours,
+    farm_expected_usd: row.farm_expected_usd,
+    farm_value_per_hour_usd: row.farm_value_per_hour_usd,
     peer_multiple: row.model.peer_multiple,
     growth_multiplier: row.model.growth_multiplier,
     maturity_multiplier: row.model.maturity_multiplier,
@@ -785,8 +1079,8 @@ export function radarRow(row: BoardRow): RadarRow {
 /** Everything the dashboard renders, from the snapshot. */
 export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: RadarData; fit: FitParams; validation: Validation } {
   const fit = fitModel(snapshot);
-  const validation = validateModel(snapshot, fit);
-  const board = buildBoard(snapshot, fit);
+  const { validation, half_widths } = validateModel(snapshot);
+  const board = buildBoard(snapshot, fit, half_widths);
   const live = liveRows(snapshot);
   const radar: RadarData = {
     as_of: snapshot.as_of,
@@ -801,6 +1095,7 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
       global_median_multiple: fit.global_median_multiple,
       global_odds: fit.global_odds,
       median_pre_age: fit.median_pre_age,
+      age_curve: fit.age_curve,
     },
     validation,
     accounting: accounting(snapshot, board),
