@@ -15,33 +15,38 @@
 //            cross-validated error was worse (0.62 vs 0.56 in log10), so the simpler line stays.
 //   peers    each category's median residual from that line, shrunk toward 0 by its sample size,
 //            clamped to +/-0.5 in log10: the category's peer multiple, in log form.
-//   growth   1 + 0.25 * clamp(change_7d, -50, 100) / 100: a dampened seven-day term, so a hot week
-//            lifts a row and a cold week lowers it, but neither dominates the size curve.
-//   age      0.70 + 0.30 * min(ln(1 + age_days) / ln(1096), 1): a protocol that has run longer with
-//            no token is read as more mature. Unknown age takes the pre-token median age.
+//   implied  round(10^(a + b*log10(tvl) + peerAdj)), at least $1: the value at launch, what the
+//            token would be worth if the protocol issued one. Nothing else is multiplied in.
 //   odds     the share of protocols at or above the floor in the same category that already trade,
-//            shrunk toward the global share: how often the peers launched. v2 then ages those odds:
+//            shrunk toward the global share: how often the peers launched. The odds are then aged:
 //            a survival curve fitted on every dated protocol in the snapshot (the share still
 //            pre-token at each age, made non-increasing) gives the chance a protocol that is still
-//            pre-token at a given age ever launches, and each row's odds are multiplied by that
-//            chance relative to its average over the pre-token population. The longer a protocol
-//            has sat pre-token, the lower its odds: most of its launch window is behind it.
-//            oddsMult = 0.6 + 0.8 * odds.
-//   implied  round(10^(a + b*log10(tvl) + peerAdj) * growth * age * oddsMult), at least $1.
+//            pre-token at a given age ever launches, and each row's odds take that chance relative
+//            to its average over the pre-token population. The longer a protocol has sat pre-token,
+//            the lower its odds: most of its launch window is behind it. The odds are printed
+//            beside the value and drive the farm ranking; they never touch the value itself. A
+//            value at launch and a chance of launching are different questions, kept apart.
+//
+// Earlier versions (radar-fit-1, radar-fit-2) multiplied the value by a dampened seven-day
+// growth term (1 + 0.25 * clamp(change_7d, -50, 100) / 100), a logarithmic maturity term
+// (0.70 + 0.30 * min(ln(1 + age_days) / ln(1096), 1)) and the launch odds (0.6 + 0.8 * odds).
+// radar-fit-3 drops all three from the value: the ablation below adds each back under the same
+// cross-validation folds and prints what it does to the held-out error. The growth and age
+// figures still show on every row; only the multiplication is gone.
 //   range    every row also carries a value range: the implied value widened by a per-category
 //            band whose half-width is the 80th percentile of that category's cross-validated
 //            residuals (shrunk toward the global band), so a row's range is as honest as the
 //            model's own held-out record in that category, no tighter.
 //
 // Validation is computed at build time, on the live-token protocols only, and reported honestly.
-// It scores the board's exact printed number (the full implied value, odds included) for a
+// It scores the board's exact printed number (the value at launch) for a
 // live-token protocol treated as if it were pre-token, against its actual market cap: the
 // strictest test of the printed figure. Four schemes: five-fold cross-validation (folds by a
 // hash of the slug, so they are deterministic), a walk-forward split by listing date,
 // leave-one-out over every fitted protocol, and a per-term ablation under the same folds (each
-// term removed in turn; a term is kept when removing it raises the held-out error). Every fit
-// inside a validation fold sees only that fold's training protocols. The flat 0.25xTVL rule is
-// scored on the same folds as the baseline.
+// shipped term removed in turn, each dropped term added back in turn, every variant's error
+// printed). Every fit inside a validation fold sees only that fold's training protocols. The
+// flat 0.25xTVL rule is scored on the same folds as the baseline.
 
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -103,12 +108,16 @@ export interface ValidationRun {
   baseline_median_abs_log10: number;
 }
 
-/** One ablation row: the held-out error with one term removed, and whether the term earns its place. */
+/** One ablation row: a variant of the shipped model, its held-out error, and the verdict. */
 export interface AblationRow {
   term: string;
   label: string;
+  /** 'without': a shipped term removed. 'with': a dropped term added back. */
+  variant: 'without' | 'with';
   median_abs_log10: number;
+  /** Whether the term is in the shipped model. */
   kept: boolean;
+  verdict: string;
 }
 
 /** The model's validation: cross-validation, walk-forward, leave-one-out and the term ablation. */
@@ -120,7 +129,12 @@ export interface Validation {
   range: { global_half_width_log10: number; coverage: number; level: number };
 }
 
-/** Switches that turn model terms off, for the ablation: the shipped model runs with all on. */
+/**
+ * Switches that vary the model for the ablation. The shipped model runs with every switch at
+ * its default: the fitted line and the peer adjustment in, the growth, maturity and odds terms
+ * out of the value. base:false and peer:false remove a shipped term; growth, maturity and
+ * odds:true add a dropped term back (age_decay:false keeps the age decay out of an added odds).
+ */
 export interface TermFlags {
   base?: boolean;
   peer?: boolean;
@@ -131,7 +145,7 @@ export interface TermFlags {
 }
 
 /** The model's version label: the dashboard names it. */
-export const MODEL_VERSION = 'radar-fit-2';
+export const MODEL_VERSION = 'radar-fit-3';
 
 /** The flat rule the validation compares against: the starter's 0.25xTVL. */
 const BASELINE_MULTIPLE = 0.25;
@@ -440,10 +454,10 @@ function subSnapshot(snapshot: Snapshot, protocols: SnapshotProtocol[]): Snapsho
 }
 
 /**
- * Five-fold cross-validated predictions of the full implied value for every fitted protocol:
- * each fold's model is fitted on the other folds' protocols alone (value line, peer figures,
- * launch odds and the age curve alike), then asked for the printed number of each held-out
- * protocol, as if it were pre-token.
+ * Five-fold cross-validated predictions of the board's printed number (the value at launch) for
+ * every fitted protocol: each fold's model is fitted on the other folds' protocols alone (value
+ * line, peer figures, launch odds and the age curve alike), then asked for the printed number
+ * of each held-out protocol, as if it were pre-token.
  */
 export function crossValidatePairs(snapshot: Snapshot, terms: TermFlags = {}): CvPair[] {
   const rows = fitSet(snapshot.protocols);
@@ -486,7 +500,7 @@ export function rangeHalfWidths(pairs: CvPair[]): { per_cat: Record<string, numb
  * Validate the model on the live-token protocols, honestly, under four schemes, every fit inside
  * a split seeing only that split's training protocols: five-fold cross-validation, a
  * walk-forward split by listing date, leave-one-out, and a per-term ablation under the same
- * folds. The scored prediction is the board's printed number, the full implied value.
+ * folds. The scored prediction is the board's printed number, the value at launch.
  */
 export function validateModel(snapshot: Snapshot): { validation: Validation; half_widths: { per_cat: Record<string, number>; global: number } } {
   const rows = fitSet(snapshot.protocols);
@@ -510,17 +524,28 @@ export function validateModel(snapshot: Snapshot): { validation: Validation; hal
   }
   const looScore = scorePredictions(looPairs);
 
-  const ablationSpecs: Array<{ term: string; label: string; terms: TermFlags }> = [
-    { term: 'base', label: 'Fitted TVL line (raw peer multiples instead)', terms: { base: false } },
-    { term: 'peer', label: 'Category peer adjustment', terms: { peer: false } },
-    { term: 'growth', label: 'Seven-day growth term', terms: { growth: false } },
-    { term: 'maturity', label: 'Age maturity term', terms: { maturity: false } },
-    { term: 'odds', label: 'Launch odds term', terms: { odds: false } },
-    { term: 'age_decay', label: 'Odds age decay', terms: { age_decay: false } },
+  const ablationSpecs: Array<{ term: string; label: string; variant: 'without' | 'with'; terms: TermFlags }> = [
+    { term: 'base', label: 'Fitted TVL line (raw peer multiples instead)', variant: 'without', terms: { base: false } },
+    { term: 'peer', label: 'Category peer adjustment', variant: 'without', terms: { peer: false } },
+    { term: 'growth', label: 'Seven-day growth term', variant: 'with', terms: { growth: true } },
+    { term: 'maturity', label: 'Age maturity term', variant: 'with', terms: { maturity: true } },
+    { term: 'odds', label: 'Launch odds term, age-decayed', variant: 'with', terms: { odds: true } },
+    { term: 'age_decay', label: 'Launch odds term, no age decay', variant: 'with', terms: { odds: true, age_decay: false } },
   ];
+  const full = cvScore.median_abs_log10;
   const ablation: AblationRow[] = ablationSpecs.map((spec) => {
     const score = scorePredictions(crossValidatePairs(snapshot, spec.terms));
-    return { term: spec.term, label: spec.label, median_abs_log10: score.median_abs_log10, kept: cvScore.median_abs_log10 <= score.median_abs_log10 };
+    const err = score.median_abs_log10;
+    let kept: boolean;
+    let verdict: string;
+    if (spec.variant === 'without') {
+      kept = true;
+      verdict = err > full ? 'kept: removing it raises the error' : err < full ? 'kept: removing it would lower the error' : 'kept: removing it changes nothing';
+    } else {
+      kept = false;
+      verdict = err > full ? 'dropped: adding it raises the error' : err < full ? 'dropped: adding it would lower the error' : 'dropped: adding it changes nothing';
+    }
+    return { term: spec.term, label: spec.label, variant: spec.variant, median_abs_log10: err, kept, verdict };
   });
 
   const half_widths = rangeHalfWidths(cvPairs);
@@ -577,10 +602,6 @@ export interface BoardRow {
   model: {
     peer_multiple: number;
     peer_adj_log10: number;
-    growth_pct: number;
-    growth_multiplier: number;
-    maturity_multiplier: number;
-    odds_multiplier: number;
     odds_base: number;
     odds_age_factor: number;
     age_days: number | null;
@@ -613,9 +634,7 @@ export interface RadarRow {
   farm_expected_usd: number;
   farm_value_per_hour_usd: number;
   peer_multiple: number;
-  growth_multiplier: number;
-  maturity_multiplier: number;
-  odds_multiplier: number;
+  peer_adj_log10: number;
 }
 
 /** A live-token protocol: it already trades, so the board shows the market's own value. */
@@ -695,7 +714,7 @@ export class SnapshotError extends Error {
   }
 }
 
-/** One protocol's full scoring: conditional value, odds, and the implied value that ranks it. */
+/** One protocol's full scoring: the value at launch, and the launch odds kept apart from it. */
 export function scoreProtocol(
   p: SnapshotProtocol,
   snapshot: Snapshot,
@@ -707,39 +726,36 @@ export function scoreProtocol(
   odds: number;
   oddsBase: number;
   ageFactor: number;
-  oddsMult: number;
-  growthPct: number;
-  growthMult: number;
-  maturityMult: number;
   age: number | null;
   peerMultiple: number;
   peerAdj: number;
 } {
   const age = ageDays(snapshot.as_of, p.listed_at);
-  const growth = growthTerm(p.change_7d);
-  const maturity = maturityTerm(age, fit.median_pre_age);
   const key = catKey(p);
   const peerAdj = terms.peer === false ? 0 : (fit.peer_adj[key] ?? 0);
   const peerMultiple = fit.peer_multiple[key] ?? fit.global_median_multiple;
   const tvl = Math.max(p.tvl_usd, 1);
   const line = Math.pow(10, fit.intercept + fit.slope * Math.log10(tvl) + peerAdj);
   const base = terms.base === false ? peerMultiple * tvl : line;
-  const conditional = base * (terms.growth === false ? 1 : growth.mult) * (terms.maturity === false ? 1 : maturity.mult);
+  let value = base;
+  // The dropped terms: off in the shipped model, switched on only by the ablation, which adds
+  // each back in turn and prints what it does to the held-out error.
+  if (terms.growth === true) value *= growthTerm(p.change_7d).mult;
+  if (terms.maturity === true) value *= maturityTerm(age, fit.median_pre_age).mult;
   const oddsBase = fit.odds[key] ?? fit.global_odds;
-  const ageFactor = terms.age_decay === false ? 1 : ageFactorAt(fit.age_curve, age ?? fit.median_pre_age);
+  const ageFactor = ageFactorAt(fit.age_curve, age ?? fit.median_pre_age);
   const odds = Math.min(0.97, Math.max(0.01, round4(oddsBase * ageFactor)));
-  const oddsMult = terms.odds === false ? 1 : 0.6 + 0.8 * odds;
-  const implied = Math.max(1, Math.min(100_000_000_000_000, Math.round(conditional * oddsMult)));
+  if (terms.odds === true) {
+    const o = terms.age_decay === false ? oddsBase : odds;
+    value *= 0.6 + 0.8 * Math.min(0.97, Math.max(0.01, o));
+  }
+  const implied = Math.max(1, Math.min(100_000_000_000_000, Math.round(value)));
   return {
     implied,
-    conditional: Math.max(1, Math.round(conditional)),
+    conditional: implied,
     odds,
     oddsBase: round4(oddsBase),
     ageFactor: round4(ageFactor),
-    oddsMult: round4(oddsMult),
-    growthPct: growth.pct,
-    growthMult: round4(growth.mult),
-    maturityMult: round4(maturity.mult),
     age,
     peerMultiple,
     peerAdj,
@@ -794,10 +810,6 @@ export function buildBoard(snapshot: Snapshot, fit: FitParams, halfWidths: { per
       model: {
         peer_multiple: s.peerMultiple,
         peer_adj_log10: s.peerAdj,
-        growth_pct: s.growthPct,
-        growth_multiplier: s.growthMult,
-        maturity_multiplier: s.maturityMult,
-        odds_multiplier: s.oddsMult,
         odds_base: s.oddsBase,
         odds_age_factor: s.ageFactor,
         age_days: s.age,
@@ -938,10 +950,11 @@ function gasUsdFor(chain: string): { setup: number; weekly: number } {
  * A farm plan's economics, from the plan's own steps: the out-of-pocket cost (gas only; the
  * position capital stays in the position and is not a cost), the total hours of effort, and a
  * scenario expected value. The scenario is stated, not hidden: if the token launches at the
- * row's implied value, FARM_REWARD_SHARE of that value reaches early users, split evenly among
- * FARM_ASSUMED_WALLETS qualifying wallets; the expected value weights that by the row's launch
- * odds, and $/hour divides it by the plan's hours. An estimate under a stated scenario, never
- * a promise: most launches pay nothing like it, and many pay nothing at all.
+ * row's implied value (the value at launch), FARM_REWARD_SHARE of that value reaches early
+ * users, split evenly among FARM_ASSUMED_WALLETS qualifying wallets; the expected value weights
+ * that by the row's launch odds — the one place value and odds meet — and $/hour divides it by
+ * the plan's hours. An estimate under a stated scenario, never a promise: most launches pay
+ * nothing like it, and many pay nothing at all.
  */
 export function farmEconomics(
   p: SnapshotProtocol,
@@ -1070,9 +1083,7 @@ export function radarRow(row: BoardRow): RadarRow {
     farm_expected_usd: row.farm_expected_usd,
     farm_value_per_hour_usd: row.farm_value_per_hour_usd,
     peer_multiple: row.model.peer_multiple,
-    growth_multiplier: row.model.growth_multiplier,
-    maturity_multiplier: row.model.maturity_multiplier,
-    odds_multiplier: row.model.odds_multiplier,
+    peer_adj_log10: row.model.peer_adj_log10,
   };
 }
 

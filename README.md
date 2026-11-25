@@ -20,23 +20,27 @@ Built by an AI agent for make.fun's
   protocols are accounted for.
 - **A fitted value model, not a flat multiple.** `log10(mcap) = a + b·log10(tvl) + peerAdj`, fitted by
   least squares on the 128 live-token protocols with a positive market cap (slope 0.52, R² 0.19),
-  with a per-category peer adjustment from median residuals, a dampened 7-day growth term, a
-  logarithmic maturity term, and launch odds from the peers' record at the $50M floor, decayed by
-  a survival curve over time spent pre-token (fitted on all 645 dated protocols: the longer a
-  protocol has sat pre-token, the less of its launch window is left).
+  with a per-category peer adjustment from median residuals — and nothing else multiplied in. The
+  implied value is a value at launch: what the token would be worth if the protocol issued one.
+  Launch odds from the peers' record at the $50M floor, decayed by a survival curve over time
+  spent pre-token (fitted on all 645 dated protocols: the longer a protocol has sat pre-token,
+  the less of its launch window is left), are printed beside the value and rank the farms; they
+  never touch the value. Earlier versions multiplied the value by growth, maturity and odds
+  terms; the ablation on the page adds each back and prints what it does to the held-out error.
 - **A value range on every row.** Each implied value carries an 80% band whose width is the
-  category's own cross-validated residual spread (×/÷13 typical), so the page shows how far the
+  category's own cross-validated residual spread (×/÷14.6 typical), so the page shows how far the
   model has actually been from the market in that category, not a false point precision. In
   cross-validation the band held 81% of held-out market caps.
-- **Honest validation, computed at build time.** The full printed number is scored against the
-  market caps of live-token protocols it was not fitted on: 5-fold cross-validation (median error
-  3.8x, 29% within 2x) against a flat 0.25xTVL baseline (4.9x), a walk-forward split by listing
-  date (3.3x), leave-one-out (4.2x), and a per-term ablation the dashboard prints in full,
-  including the terms that do not help on that test.
+- **Honest validation, computed at build time.** The printed number — the value at launch — is
+  scored against the market caps of live-token protocols it was not fitted on: 5-fold
+  cross-validation (median error 3.5x, 28% within 2x) against a flat 0.25xTVL baseline (4.9x), a
+  walk-forward split by listing date (3.2x), leave-one-out (4.0x), and a per-term ablation the
+  dashboard prints in full: the two shipped terms removed in turn, the four dropped terms added
+  back in turn, every variant's error shown.
 - **Concrete farm plans.** Six steps per protocol with sized capital (standard and minimum-viable),
   chain-aware gas costs, a hold period by age, a second qualifying action per category, and the
   plan's economics: total gas cost, total hours, and a scenario $/hour (a launch paying early
-  users 5% of the implied value, split over 10,000 wallets, weighted by the launch odds — a
+  users 5% of the value at launch, split over 10,000 wallets, weighted by the launch odds — a
   stated scenario, labelled as an estimate, never a promise).
 - **A dashboard a reader can use.** Sortable and filterable board (search, category, chain, TVL and
   odds bands), a detail view per protocol with the model breakdown, verdict and live-token comps, a
